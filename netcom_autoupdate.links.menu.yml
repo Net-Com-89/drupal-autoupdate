@@ -1,0 +1,5 @@
+netcom_autoupdate.settings:
+  title: 'Mises à jour automatiques'
+  description: 'Réglages et historique des mises à jour Composer nocturnes.'
+  route_name: netcom_autoupdate.settings
+  parent: system.admin_config_system

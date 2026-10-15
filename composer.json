@@ -1,0 +1,17 @@
+{
+    "name": "netcom/drupal-autoupdate",
+    "description": "Mises à jour Composer automatiques (mineures et patchs) pour Drupal 11+, avec retour arrière et notification Discord.",
+    "type": "drupal-module",
+    "license": "GPL-2.0-or-later",
+    "homepage": "https://github.com/Net-Com-89/drupal-autoupdate",
+    "keywords": ["drupal", "composer", "updates"],
+    "require": {
+        "php": ">=8.3",
+        "composer/installers": "^2.0",
+        "drupal/core": "^11.2 || ^12"
+    },
+    "bin": ["bin/drupal-autoupdate"],
+    "extra": {
+        "installer-name": "netcom_autoupdate"
+    }
+}

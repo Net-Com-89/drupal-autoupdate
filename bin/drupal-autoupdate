@@ -1,0 +1,1147 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * @file
+ * Mises à jour Composer automatiques d'un Drupal : mineures et patchs seulement.
+ *
+ * Un seul fichier, sans include ni démarrage de Drupal : PHP le compile en
+ * entier au lancement, il survit donc à `composer install` qui remplace son
+ * propre paquet. Toute l'interaction avec Drupal passe par drush.
+ */
+
+declare(strict_types=1);
+
+namespace Netcom\DrupalAutoupdate;
+
+const SETTINGS_KEY = 'netcom_autoupdate.settings';
+const HISTORY_KEY = 'netcom_autoupdate.history';
+const HISTORY_SIZE = 30;
+const LOGS_KEPT = 30;
+const PATCHES_LOCK = 'patches.lock.json';
+
+// Miroir de \Drupal\netcom_autoupdate\Settings::DEFAULTS : ce fichier ne peut rien inclure.
+const DEFAULTS = [
+  'enabled' => FALSE,
+  'label' => '',
+  'environment' => '',
+  'discord_webhook' => '',
+  'min_release_age' => 3,
+  'sites' => [],
+  'smoke_paths' => ['/'],
+  'smoke_urls' => [],
+  'maintenance_mode' => TRUE,
+  'keep_backups' => 3,
+];
+
+final class Failure extends \RuntimeException {
+
+  public function __construct(string $message, public readonly string $output = '') {
+    parent::__construct($message);
+  }
+
+  public function excerpt(int $lines = 15): string {
+    $all = preg_split('/\R/', trim($this->output)) ?: [];
+    return implode("\n", array_slice($all, -$lines));
+  }
+
+}
+
+final class Logger {
+
+  /** @var resource|null */
+  private $file = NULL;
+
+  public function __construct(?string $path) {
+    if ($path !== NULL) {
+      $this->file = @fopen($path, 'ab') ?: NULL;
+    }
+  }
+
+  public function line(string $message): void {
+    $this->raw('[' . date('Y-m-d H:i:s') . '] ' . $message . "\n");
+  }
+
+  public function raw(string $text): void {
+    fwrite(STDOUT, $text);
+    if ($this->file) {
+      fwrite($this->file, $text);
+    }
+  }
+
+}
+
+final class Proc {
+
+  /**
+   * Lance une commande sans shell.
+   *
+   * @return array{int, string}
+   *   Code de sortie et sortie standard. Avec $echo, stderr est fusionné dans
+   *   la sortie et le tout est journalisé ; sinon stderr n'est renvoyé qu'en
+   *   cas d'échec, pour ne pas polluer une sortie JSON.
+   */
+  public static function run(array $cmd, string $cwd, ?Logger $log = NULL, bool $echo = TRUE): array {
+    $err = tempnam(sys_get_temp_dir(), 'nau');
+    $spec = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => $echo ? ['redirect', 1] : ['file', $err, 'w']];
+    if ($echo) {
+      $log?->line('$ ' . implode(' ', array_map(self::quote(...), $cmd)));
+    }
+    $process = proc_open($cmd, $spec, $pipes, $cwd);
+    if (!is_resource($process)) {
+      @unlink($err);
+      throw new Failure('Impossible de lancer : ' . $cmd[0]);
+    }
+    $out = '';
+    while (($line = fgets($pipes[1])) !== FALSE) {
+      $out .= $line;
+      if ($echo) {
+        $log?->raw($line);
+      }
+    }
+    fclose($pipes[1]);
+    $code = proc_close($process);
+    if (!$echo && $code !== 0) {
+      $out .= (string) file_get_contents($err);
+    }
+    @unlink($err);
+    return [$code, $out];
+  }
+
+  public static function which(string $binary): ?string {
+    foreach (explode(PATH_SEPARATOR, (string) getenv('PATH')) as $dir) {
+      if ($dir !== '' && is_file("$dir/$binary") && is_executable("$dir/$binary")) {
+        return "$dir/$binary";
+      }
+    }
+    return NULL;
+  }
+
+  private static function quote(string $arg): string {
+    return preg_match('/^[\w\/.:=@,+-]+$/', $arg) ? $arg : escapeshellarg($arg);
+  }
+
+}
+
+final class Http {
+
+  /**
+   * @return array{int, string}
+   *   Code HTTP (0 si injoignable) et corps de la réponse.
+   */
+  public static function request(string $method, string $url, array $headers = [], ?string $body = NULL, int $timeout = 30): array {
+    if (function_exists('curl_init')) {
+      // libcurl lit seul les variables http(s)_proxy de l'environnement.
+      $ch = curl_init($url);
+      curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_RETURNTRANSFER => TRUE,
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 10,
+      ]);
+      if ($body !== NULL) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+      }
+      $response = curl_exec($ch);
+      return [(int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE), is_string($response) ? $response : ''];
+    }
+    $options = ['method' => $method, 'header' => implode("\r\n", $headers), 'timeout' => $timeout, 'ignore_errors' => TRUE, 'follow_location' => 0];
+    if ($body !== NULL) {
+      $options['content'] = $body;
+    }
+    $proxy = getenv('https_proxy') ?: getenv('HTTPS_PROXY') ?: getenv('http_proxy') ?: getenv('HTTP_PROXY');
+    if ($proxy) {
+      $options['proxy'] = preg_replace('#^https?://#', 'tcp://', $proxy);
+    }
+    $response = @file_get_contents($url, FALSE, stream_context_create(['http' => $options]));
+    $status = 0;
+    $headers = function_exists('http_get_last_response_headers') ? http_get_last_response_headers() : (get_defined_vars()['http_response_header'] ?? []);
+    foreach ($headers ?? [] as $header) {
+      if (preg_match('#^HTTP/\S+\s+(\d{3})#', $header, $m)) {
+        $status = (int) $m[1];
+      }
+    }
+    return [$status, is_string($response) ? $response : ''];
+  }
+
+}
+
+final class Lock {
+
+  public static function read(string $file): array {
+    $data = is_file($file) ? json_decode((string) file_get_contents($file), TRUE) : NULL;
+    if (!is_array($data)) {
+      throw new Failure("Fichier illisible : $file");
+    }
+    return $data;
+  }
+
+  /**
+   * @return array<string, array{version: string, time: ?int, type: string}>
+   */
+  public static function packages(array $lock, bool $withDev = TRUE): array {
+    $out = [];
+    foreach (array_merge($lock['packages'] ?? [], $withDev ? ($lock['packages-dev'] ?? []) : []) as $package) {
+      // Les paquets de packages.drupal.org n'ont pas de « time » : leur date est dans extra.
+      $time = isset($package['time']) ? strtotime($package['time']) : (int) ($package['extra']['drupal']['datestamp'] ?? 0);
+      $out[$package['name']] = ['version' => $package['version'], 'time' => $time ?: NULL, 'type' => $package['type'] ?? 'library'];
+    }
+    return $out;
+  }
+
+  /**
+   * Versions réellement installées dans vendor/, qui font foi quand le lock diverge.
+   *
+   * @return array{versions: array<string, string>, dev: bool}|null
+   */
+  public static function installed(string $vendorDir): ?array {
+    $file = "$vendorDir/composer/installed.json";
+    if (!is_file($file)) {
+      return NULL;
+    }
+    $data = json_decode((string) file_get_contents($file), TRUE) ?: [];
+    $versions = [];
+    foreach ($data['packages'] ?? [] as $package) {
+      $versions[$package['name']] = $package['version'];
+    }
+    return ['versions' => $versions, 'dev' => (bool) ($data['dev'] ?? TRUE)];
+  }
+
+  // Les paquets drupal.org anciens se versionnent « 8.x-1.5 ».
+  public static function normalize(string $version): string {
+    return (string) preg_replace(['/^v(?=\d)/', '/^\d+\.x-/'], '', $version);
+  }
+
+  public static function isDev(string $version): bool {
+    return str_starts_with($version, 'dev-') || str_ends_with($version, '-dev');
+  }
+
+  // En 0.x, la mineure fait office de majeure (sémantique du ^ de Composer).
+  public static function major(string $version): string {
+    $parts = explode('.', self::normalize($version));
+    return $parts[0] === '0' ? '0.' . ($parts[1] ?? '') : $parts[0];
+  }
+
+  public static function isLower(string $a, string $b): bool {
+    return !self::isDev($a) && !self::isDev($b) && version_compare(self::normalize($a), self::normalize($b), '<');
+  }
+
+  /**
+   * @return list<array{name: string, from: ?string, to: ?string, time: ?int, type: string, drupal: bool}>
+   *   type : update, major, downgrade, add, remove ou dev.
+   */
+  public static function diff(array $old, array $new): array {
+    $before = self::packages($old);
+    $after = self::packages($new);
+    $changes = [];
+    foreach ($after as $name => $info) {
+      $from = $before[$name]['version'] ?? NULL;
+      if ($from !== $info['version']) {
+        $changes[] = ['name' => $name, 'from' => $from, 'to' => $info['version'], 'time' => $info['time'], 'type' => self::kind($from, $info['version']), 'drupal' => str_starts_with($info['type'], 'drupal-')];
+      }
+    }
+    foreach (array_diff_key($before, $after) as $name => $info) {
+      $changes[] = ['name' => $name, 'from' => $info['version'], 'to' => NULL, 'time' => NULL, 'type' => 'remove', 'drupal' => str_starts_with($info['type'], 'drupal-')];
+    }
+    return $changes;
+  }
+
+  public static function describe(array $change): string {
+    return match (TRUE) {
+      $change['from'] === NULL => "+ {$change['name']} {$change['to']}",
+      $change['to'] === NULL => "- {$change['name']} {$change['from']}",
+      $change['type'] === 'major' => "{$change['name']} {$change['from']} → {$change['to']} (majeure, imposée par une dépendance)",
+      default => "{$change['name']} {$change['from']} → {$change['to']}",
+    };
+  }
+
+  private static function kind(?string $from, string $to): string {
+    return match (TRUE) {
+      $from === NULL => 'add',
+      self::isDev($from) || self::isDev($to) => 'dev',
+      self::major($from) !== self::major($to) => 'major',
+      self::isLower($to, $from) => 'downgrade',
+      default => 'update',
+    };
+  }
+
+}
+
+final class Project {
+
+  public readonly string $vendorDir;
+  public readonly string $workDir;
+  private array $composerCmd;
+  private string $drushBin;
+  private ?array $settingsCache = NULL;
+  public bool $settingsFound = FALSE;
+  public ?Logger $log = NULL;
+
+  public function __construct(public readonly string $root, public readonly ?string $uri, ?string $composer) {
+    $json = Lock::read("$root/composer.json");
+    $this->vendorDir = $root . '/' . ($json['config']['vendor-dir'] ?? 'vendor');
+    $this->drushBin = $root . '/' . ($json['config']['bin-dir'] ?? ($json['config']['vendor-dir'] ?? 'vendor') . '/bin') . '/drush';
+    $this->composerCmd = $this->findComposer($composer);
+    $this->workDir = "$root/.autoupdate";
+  }
+
+  public static function locate(?string $root): string {
+    $starts = $root !== NULL ? [$root] : array_filter([$GLOBALS['_composer_bin_dir'] ?? NULL, getcwd()]);
+    foreach ($starts as $dir) {
+      for ($dir = realpath($dir) ?: $dir; $dir !== dirname($dir); $dir = dirname($dir)) {
+        if (is_file("$dir/composer.json") && is_file("$dir/composer.lock")) {
+          return $dir;
+        }
+        if ($root !== NULL) {
+          break;
+        }
+      }
+    }
+    throw new Failure('Racine Composer introuvable (composer.json + composer.lock) : préciser --root.');
+  }
+
+  public function prepareWorkDir(): void {
+    foreach ([$this->workDir, "$this->workDir/backups", "$this->workDir/logs", "$this->workDir/last"] as $dir) {
+      if (!is_dir($dir) && !@mkdir($dir, 0750, TRUE)) {
+        throw new Failure("Impossible de créer $dir");
+      }
+    }
+    // Le dossier contient des dumps de base : jamais versionné, jamais servi.
+    @file_put_contents("$this->workDir/.gitignore", "*\n");
+    @file_put_contents("$this->workDir/.htaccess", "Require all denied\n");
+  }
+
+  public function composer(array $args, bool $echo = TRUE): array {
+    return Proc::run([...$this->composerCmd, ...$args], $this->root, $this->log, $echo);
+  }
+
+  public function drush(?string $uri, array $args, bool $echo = TRUE): array {
+    return Proc::run([$this->drushBin, ...($uri !== NULL ? ["--uri=$uri"] : []), ...$args], $this->root, $this->log, $echo);
+  }
+
+  public function drushOrFail(?string $uri, array $args, string $what, bool $echo = TRUE): string {
+    [$code, $out] = $this->drush($uri, $args, $echo);
+    if ($code !== 0) {
+      throw new Failure($what . ($uri !== NULL ? " ($uri)" : ''), $out);
+    }
+    return $out;
+  }
+
+  public function composerVersion(): ?string {
+    [$code, $out] = $this->composer(['--version', '--no-ansi'], FALSE);
+    return $code === 0 && preg_match('/(\d+\.\d+\.\d+)/', $out, $m) ? $m[1] : NULL;
+  }
+
+  public function hasDrush(): bool {
+    return is_file($this->drushBin);
+  }
+
+  public function stateGet(string $key): mixed {
+    [$code, $out] = $this->drush($this->uri, ['state:get', $key, '--format=json'], FALSE);
+    if ($code !== 0) {
+      return NULL;
+    }
+    $data = json_decode($out, TRUE);
+    return is_array($data) && array_key_exists($key, $data) ? $data[$key] : $data;
+  }
+
+  public function stateSet(string $key, mixed $value): void {
+    $this->drushOrFail($this->uri, ['state:set', $key, json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), '--input-format=json'], "Écriture du state $key", FALSE);
+  }
+
+  public function settings(): array {
+    if ($this->settingsCache === NULL) {
+      $stored = $this->hasDrush() ? $this->stateGet(SETTINGS_KEY) : NULL;
+      $this->settingsFound = is_array($stored);
+      $this->settingsCache = (is_array($stored) ? $stored : []) + DEFAULTS;
+    }
+    return $this->settingsCache;
+  }
+
+  /**
+   * @return list<?string>
+   *   URIs drush des sites ; NULL désigne le site par défaut.
+   */
+  public function sites(): array {
+    $sites = array_values(array_filter(array_map('trim', (array) $this->settings()['sites'])));
+    return $sites ?: [$this->uri];
+  }
+
+  public function label(): string {
+    $settings = $this->settings();
+    $label = trim((string) $settings['label']);
+    if ($label === '' && $this->hasDrush()) {
+      [$code, $out] = $this->drush($this->uri, ['config:get', 'system.site', 'name', '--format=string'], FALSE);
+      $label = $code === 0 ? trim($out) : '';
+    }
+    $label = $label !== '' ? $label : basename($this->root);
+    return $settings['environment'] !== '' ? "$label [{$settings['environment']}]" : $label;
+  }
+
+  public function lockFiles(): array {
+    return array_filter(['composer.json', 'composer.lock', PATCHES_LOCK], fn ($f) => is_file("$this->root/$f"));
+  }
+
+  public function installArgs(): array {
+    $installed = Lock::installed($this->vendorDir);
+    return ['install', '--no-interaction', '--no-progress', '--optimize-autoloader', ...(($installed['dev'] ?? TRUE) ? [] : ['--no-dev'])];
+  }
+
+  public function recordHistory(array $entry): void {
+    $history = $this->stateGet(HISTORY_KEY);
+    $history = is_array($history) ? $history : [];
+    array_unshift($history, $entry);
+    $this->stateSet(HISTORY_KEY, array_slice($history, 0, HISTORY_SIZE));
+  }
+
+  public function notify(string $text, string $attachment = ''): void {
+    $webhook = trim((string) $this->settings()['discord_webhook']);
+    if ($webhook === '') {
+      return;
+    }
+    // Discord limite un message à 2 000 caractères : le surplus part en pièce jointe.
+    if (mb_strlen($text) > 1900) {
+      $attachment = $text . ($attachment !== '' ? "\n\n$attachment" : '');
+      $text = mb_substr($text, 0, (int) mb_strpos($text, "\n") ?: 200) . "\nRapport complet en pièce jointe.";
+    }
+    $payload = json_encode(['username' => 'Drupal autoupdate', 'allowed_mentions' => ['parse' => []], 'content' => $text]);
+    if ($attachment === '') {
+      [$status] = Http::request('POST', $webhook, ['Content-Type: application/json'], $payload);
+    }
+    else {
+      $boundary = 'nau' . bin2hex(random_bytes(8));
+      $body = "--$boundary\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n$payload\r\n"
+        . "--$boundary\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"rapport.txt\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n$attachment\r\n--$boundary--\r\n";
+      [$status] = Http::request('POST', $webhook, ["Content-Type: multipart/form-data; boundary=$boundary"], $body);
+    }
+    if ($status < 200 || $status >= 300) {
+      $this->log?->line("Notification Discord refusée (HTTP $status).");
+    }
+  }
+
+  public function prune(string $dir, int $keep): void {
+    $entries = glob("$dir/*") ?: [];
+    rsort($entries);
+    foreach (array_slice($entries, max(0, $keep)) as $entry) {
+      self::remove($entry);
+    }
+  }
+
+  public static function remove(string $path): void {
+    if (is_dir($path) && !is_link($path)) {
+      foreach (scandir($path) ?: [] as $item) {
+        if ($item !== '.' && $item !== '..') {
+          self::remove("$path/$item");
+        }
+      }
+      @rmdir($path);
+      return;
+    }
+    @unlink($path);
+  }
+
+  private function findComposer(?string $option): array {
+    if ($option !== NULL && $option !== '') {
+      return preg_split('/\s+/', trim($option));
+    }
+    foreach ([getenv('COMPOSER_BINARY') ?: NULL, Proc::which('composer'), "$this->root/composer.phar"] as $candidate) {
+      if ($candidate !== NULL && is_file($candidate)) {
+        return str_ends_with($candidate, '.phar') ? [PHP_BINARY, $candidate] : [$candidate];
+      }
+    }
+    return ['composer'];
+  }
+
+}
+
+final class Checker {
+
+  public function __construct(private Project $p) {}
+
+  /**
+   * @return list<array{string, string}>
+   *   [niveau, message], niveau parmi ok, warn, fail.
+   */
+  public function run(): array {
+    $p = $this->p;
+    $r = [];
+    $version = $p->composerVersion();
+    $r[] = match (TRUE) {
+      $version === NULL => ['fail', 'Composer introuvable (option --composer).'],
+      version_compare($version, '2.4', '<') => ['fail', "Composer $version : 2.4 minimum requis."],
+      default => ['ok', "Composer $version."],
+    };
+    if (!$p->hasDrush()) {
+      return [...$r, ['fail', 'drush absent de vendor/bin : composer require drush/drush.']];
+    }
+    $settings = $p->settings();
+    $r[] = $p->settingsFound ? ['ok', 'Réglages lus dans Drupal.'] : ['warn', 'Aucun réglage enregistré : module activé (drush en netcom_autoupdate) et formulaire validé ?'];
+    $r[] = $settings['enabled'] ? ['ok', 'Mises à jour automatiques activées.'] : ['warn', 'Mises à jour automatiques désactivées dans les réglages.'];
+    $r[] = trim((string) $settings['discord_webhook']) !== '' ? ['ok', 'Webhook Discord renseigné.'] : ['warn', 'Aucun webhook Discord : aucune notification ne partira.'];
+    foreach ($p->sites() as $uri) {
+      $name = $uri ?? 'site par défaut';
+      [$code, $out] = $p->drush($uri, ['status', '--field=bootstrap'], FALSE);
+      if ($code !== 0 || trim($out) !== 'Successful') {
+        $r[] = ['fail', "Drupal ne démarre pas via drush ($name)."];
+        continue;
+      }
+      [, $driver] = $p->drush($uri, ['status', '--field=db-driver'], FALSE);
+      $tools = ['mysql' => ['mysqldump', 'mariadb-dump'], 'pgsql' => ['pg_dump'], 'sqlite' => ['sqlite3']][trim($driver)] ?? [];
+      $r[] = array_filter(array_map(Proc::which(...), $tools))
+        ? ['ok', "Outil de sauvegarde de la base présent ($name)."]
+        : ['fail', "Aucun outil de dump pour la base « " . trim($driver) . " » (" . implode(' ou ', $tools) . ") : impossible de sauvegarder, donc de revenir en arrière ($name)."];
+      [$code, $out] = $p->drush($uri, ['config:status', '--format=json'], FALSE);
+      $drift = $code === 0 ? (json_decode($out, TRUE) ?: []) : [];
+      if ($drift) {
+        $r[] = ['warn', count($drift) . " écart(s) de config déjà présents ($name) : seuls les nouveaux écarts seront signalés."];
+      }
+    }
+    foreach (['' => $p->root, 'composer.lock' => "$p->root/composer.lock", 'vendor' => $p->vendorDir] as $label => $path) {
+      if (!is_writable($path)) {
+        $r[] = ['fail', 'Pas de droit d\'écriture sur ' . ($label ?: $p->root) . ' : lancer la tâche avec le propriétaire du code.'];
+      }
+    }
+    $r = [...$r, ...$this->lockSync(), ...$this->patches(), ...$this->constraints()];
+    if (is_file("$p->root/index.php") && is_dir("$p->root/core")) {
+      $r[] = ['warn', 'La racine Composer est aussi la racine web : .autoupdate/ (dumps) n\'est protégé que par son .htaccess.'];
+    }
+    return $r;
+  }
+
+  public static function failures(array $results): array {
+    return array_column(array_filter($results, fn ($r) => $r[0] === 'fail'), 1);
+  }
+
+  private function lockSync(): array {
+    $installed = Lock::installed($this->p->vendorDir);
+    if ($installed === NULL) {
+      return [['fail', 'vendor/ non installé : lancer composer install.']];
+    }
+    $lock = Lock::packages(Lock::read($this->p->root . '/composer.lock'), $installed['dev']);
+    $mismatch = [];
+    foreach ($lock as $name => $info) {
+      if (($installed['versions'][$name] ?? NULL) !== $info['version']) {
+        $mismatch[] = $name;
+      }
+    }
+    return $mismatch
+      ? [['fail', 'composer.lock et vendor/ divergent (' . implode(', ', array_slice($mismatch, 0, 5)) . (count($mismatch) > 5 ? '…' : '') . ') : lancer composer install.']]
+      : [['ok', 'composer.lock et vendor/ cohérents.']];
+  }
+
+  private function patches(): array {
+    $installed = Lock::installed($this->p->vendorDir)['versions'] ?? [];
+    $version = $installed['cweagans/composer-patches'] ?? NULL;
+    if ($version === NULL) {
+      return [];
+    }
+    $extra = Lock::read($this->p->root . '/composer.json')['extra'] ?? [];
+    if (Lock::major($version) === '1') {
+      return ($extra['composer-exit-on-patch-failure'] ?? FALSE) === TRUE
+        ? [['ok', 'composer-patches 1.x : échec bloquant si un patch ne s\'applique plus.']]
+        : [['fail', 'composer-patches 1.x sans "composer-exit-on-patch-failure": true dans extra : un patch qui ne s\'applique plus serait ignoré en silence.']];
+    }
+    $hasPatches = !empty($extra['patches']) || !empty($extra['patches-file']) || is_file($this->p->root . '/' . PATCHES_LOCK);
+    return $hasPatches && Proc::which('git') === NULL
+      ? [['fail', 'composer-patches 2.x a besoin de git pour appliquer les patches : git est absent.']]
+      : [];
+  }
+
+  private function constraints(): array {
+    $require = Lock::read($this->p->root . '/composer.json')['require'] ?? [];
+    $open = [];
+    foreach ($require as $name => $constraint) {
+      if (str_contains($name, '/') && (trim($constraint) === '*' || (preg_match('/>/', $constraint) && !preg_match('/<|\^|~|\|\|/', $constraint)))) {
+        $open[] = "$name ($constraint)";
+      }
+    }
+    return $open ? [['warn', 'Contraintes sans borne haute (le garde-fou bloquera toute majeure) : ' . implode(', ', $open) . '.']] : [];
+  }
+
+}
+
+final class Runner {
+
+  private array $settings;
+  private array $sites;
+  private string $runId;
+  private string $backupDir;
+  private array $changes = [];
+  private array $held = [];
+  private array $warnings = [];
+  private array $maintenance = [];
+  private array $brokenBefore = [];
+
+  public function __construct(private Project $p, private Logger $log, private bool $force, private bool $dryRun) {
+    $this->runId = date('Ymd-His');
+  }
+
+  public function run(): int {
+    $this->settings = $this->p->settings();
+    if (!$this->settings['enabled'] && !$this->force && !$this->dryRun) {
+      $this->log->line('Désactivé dans les réglages : rien à faire.');
+      return 0;
+    }
+    $this->sites = $this->p->sites();
+    $failures = Checker::failures((new Checker($this->p))->run());
+    if ($failures) {
+      return $this->finish('error', 'Prérequis non remplis : ' . implode(' ', $failures));
+    }
+
+    $this->backupDir = "{$this->p->workDir}/backups/$this->runId";
+    @mkdir($this->backupDir, 0750, TRUE);
+    foreach ($this->p->lockFiles() as $file) {
+      copy($this->p->root . "/$file", "$this->backupDir/$file");
+    }
+    $oldLock = Lock::read("$this->backupDir/composer.lock");
+
+    try {
+      $resolved = $this->resolve($oldLock);
+    }
+    catch (Failure $e) {
+      $this->restoreFiles();
+      return $this->finish('error', $e->getMessage(), $e->excerpt());
+    }
+    if ($resolved === NULL) {
+      $this->restoreFiles();
+      return $this->finish('held', 'Mise à jour reportée.');
+    }
+    $this->changes = $resolved;
+
+    // N.Y.Y vaut pour les dépendances du projet et tout paquet Drupal ; une
+    // bibliothèque transitive suit ce qu'exige son parent (core-recommended
+    // change ainsi de majeure de doctrine/lexer entre deux mineures du core).
+    $root = Lock::read($this->p->root . '/composer.json');
+    $guarded = array_flip(array_keys(($root['require'] ?? []) + ($root['require-dev'] ?? [])));
+    $blocked = array_filter($this->changes, fn ($c) => in_array($c['type'], ['major', 'downgrade'], TRUE) && ($c['drupal'] || isset($guarded[$c['name']])));
+    if ($blocked) {
+      $this->restoreFiles();
+      return $this->finish('blocked', 'Mise à jour bloquée par le garde-fou (majeure ou retour arrière de version) : ' . implode(', ', array_map(Lock::describe(...), $blocked)) . '. Vérifier les contraintes de composer.json.');
+    }
+    // Sans interaction, Composer refuse d'installer un plugin non autorisé ; l'autoriser
+    // ici seulement casserait le déploiement suivant, qui reprend le composer.json du dépôt.
+    $plugins = $this->unallowedPlugins($root, Lock::read($this->p->root . '/composer.lock'));
+    if ($plugins) {
+      $this->restoreFiles();
+      return $this->finish('blocked', 'Nouveau plugin Composer à autoriser dans le composer.json du dépôt, puis à déployer : ' . implode(', ', array_map(fn ($n) => "\"config.allow-plugins.$n\": true", $plugins)) . '.');
+    }
+    if (!$this->changes) {
+      $this->restoreFiles();
+      return $this->finish('uptodate', 'Déjà à jour' . ($this->held ? ' (hors paquets trop récents)' : '') . '.');
+    }
+    if ($this->dryRun) {
+      $this->restoreFiles();
+      $this->discardUnusedBackup();
+      $this->log->line('Simulation : ' . count($this->changes) . " changement(s), rien d'appliqué.");
+      foreach ($this->changes as $change) {
+        $this->log->line('  ' . Lock::describe($change));
+      }
+      return 0;
+    }
+    return $this->apply();
+  }
+
+  /**
+   * Calcule le nouveau lock, sans rien installer.
+   *
+   * @return list<array>|null
+   *   Les changements, ou NULL si les paquets trop récents empêchent toute résolution.
+   */
+  private function resolve(array $oldLock): ?array {
+    $minAge = max(0, (int) $this->settings['min_release_age']);
+    $vulnerable = $this->vulnerable();
+    if ($vulnerable) {
+      $this->warnings[] = 'Avis de sécurité sur la version installée de : ' . implode(', ', $vulnerable) . ' (âge minimal ignoré).';
+    }
+    $ignoreAge = $minAge === 0 || $vulnerable;
+    // Une version trop récente est exclue par contrainte temporaire : Composer
+    // retombe sur la plus récente des versions assez anciennes.
+    $pins = [];
+    for ($attempt = 0; $attempt < 10; $attempt++) {
+      $this->restoreFiles();
+      $args = ['update', '--with-all-dependencies', '--no-install', '--no-scripts', '--no-interaction', '--no-progress'];
+      foreach ($pins as $name => $pin) {
+        $args[] = "--with=$name:>={$pin['from']} <{$pin['below']}";
+      }
+      [$code, $out] = $this->p->composer($args);
+      if ($code !== 0) {
+        if ($pins) {
+          $this->warnings[] = 'Résolution impossible en retenant les versions trop récentes : nouvel essai demain.';
+          return NULL;
+        }
+        throw new Failure('composer update a échoué.', $out);
+      }
+      $changes = Lock::diff($oldLock, Lock::read($this->p->root . '/composer.lock'));
+      if ($ignoreAge) {
+        return $changes;
+      }
+      $young = array_filter($changes, fn ($c) => $c['type'] === 'update' && $c['time'] !== NULL && $c['time'] > time() - $minAge * 86400);
+      if (!$young) {
+        return $changes;
+      }
+      foreach ($young as $change) {
+        $pins[$change['name']] = ['from' => $pins[$change['name']]['from'] ?? $change['from'], 'below' => $change['to']];
+        $this->held[$change['name']] = $this->held[$change['name']] ?? $change['to'];
+      }
+    }
+    throw new Failure('Résolution instable avec les paquets retenus.');
+  }
+
+  private function unallowedPlugins(array $root, array $lock): array {
+    $allowed = $root['config']['allow-plugins'] ?? [];
+    if ($allowed === TRUE) {
+      return [];
+    }
+    $out = [];
+    foreach (array_merge($lock['packages'] ?? [], $lock['packages-dev'] ?? []) as $package) {
+      if (($package['type'] ?? '') !== 'composer-plugin') {
+        continue;
+      }
+      $known = array_filter(array_keys((array) $allowed), fn ($pattern) => fnmatch($pattern, $package['name']));
+      if (!$known) {
+        $out[] = $package['name'];
+      }
+    }
+    return $out;
+  }
+
+  private function vulnerable(): array {
+    [, $out] = $this->p->composer(['audit', '--locked', '--format=json', '--no-interaction'], FALSE);
+    $data = json_decode(substr($out, (int) strpos($out, '{')), TRUE);
+    return array_keys(array_filter((array) ($data['advisories'] ?? [])));
+  }
+
+  private function apply(): int {
+    $driftBefore = $this->configStatus();
+    $this->brokenBefore = $this->smoke(TRUE);
+    if ($this->brokenBefore) {
+      $this->warnings[] = 'Déjà en échec avant la mise à jour, non pris en compte : ' . implode(', ', $this->brokenBefore) . '.';
+    }
+    try {
+      foreach ($this->sites as $i => $uri) {
+        $this->maintenance[$i] = trim($this->p->drushOrFail($uri, ['state:get', 'system.maintenance_mode', '--format=string'], 'Lecture du mode maintenance', FALSE)) === '1';
+      }
+      $this->setMaintenance(TRUE);
+      foreach ($this->sites as $i => $uri) {
+        $this->p->drushOrFail($uri, ['sql:dump', '--gzip', "--result-file=$this->backupDir/db-$i.sql"], 'Sauvegarde de la base');
+      }
+    }
+    catch (Failure $e) {
+      $this->restoreFiles();
+      $this->restoreMaintenance();
+      return $this->finish('error', 'Sauvegarde impossible, rien n\'a été modifié : ' . $e->getMessage(), $e->excerpt());
+    }
+
+    try {
+      [$code, $out] = $this->p->composer($this->p->installArgs());
+      if ($code !== 0) {
+        throw new Failure('composer install a échoué.', $out);
+      }
+      foreach ($this->sites as $uri) {
+        $this->p->drushOrFail($uri, ['updatedb', '-y'], 'drush updatedb a échoué');
+      }
+      foreach ($this->sites as $uri) {
+        $this->p->drushOrFail($uri, ['cache:rebuild'], 'drush cache:rebuild a échoué');
+      }
+      $this->restoreMaintenance();
+      $this->smoke();
+    }
+    catch (Failure $e) {
+      return $this->rollback($e);
+    }
+
+    $drift = [];
+    foreach (array_diff_key($this->configStatus(), $driftBefore) as $name => $site) {
+      $drift[$site][] = $name;
+    }
+    foreach ($drift as $site => $names) {
+      $this->warnings[] = "Config modifiée par les update hooks ($site), à exporter en dev avant le prochain config:import : " . implode(', ', $names) . '.';
+    }
+    $remaining = $this->vulnerable();
+    if ($remaining) {
+      $this->warnings[] = 'Avis de sécurité toujours ouverts (correctif hors mineures ?) : ' . implode(', ', $remaining) . '.';
+    }
+    $this->saveLast();
+    $this->p->prune("{$this->p->workDir}/backups", (int) $this->settings['keep_backups']);
+    return $this->finish('success', count($this->changes) . ' paquet(s) mis à jour.');
+  }
+
+  private function rollback(Failure $cause): int {
+    $this->log->line('ÉCHEC : ' . $cause->getMessage() . ' → retour arrière.');
+    try {
+      foreach ($this->sites as $uri) {
+        $this->p->drush($uri, ['state:set', 'system.maintenance_mode', '1', '--input-format=integer']);
+      }
+      $this->restoreFiles();
+      [$code, $out] = $this->p->composer($this->p->installArgs());
+      if ($code !== 0) {
+        throw new Failure('composer install du lock précédent a échoué.', $out);
+      }
+      foreach ($this->sites as $i => $uri) {
+        // drush décompresse le fichier sur place : on lui passe une copie pour garder la sauvegarde intacte.
+        $copy = sys_get_temp_dir() . "/nau-restore-$this->runId-$i.sql.gz";
+        copy("$this->backupDir/db-$i.sql.gz", $copy);
+        $this->p->drushOrFail($uri, ['sql:drop', '-y'], 'Vidage de la base');
+        $this->p->drushOrFail($uri, ['sql:query', "--file=$copy"], 'Restauration de la base');
+        @unlink($copy);
+        @unlink(substr($copy, 0, -3));
+        $this->p->drushOrFail($uri, ['cache:rebuild'], 'drush cache:rebuild a échoué');
+      }
+      // Le dump a été pris en maintenance : il faut rétablir l'état d'origine.
+      $this->restoreMaintenance();
+      $this->smoke();
+    }
+    catch (Failure $e) {
+      return $this->finish('critical', 'Échec : ' . $cause->getMessage() . ' Puis échec du retour arrière : ' . $e->getMessage() . " Intervention requise : sauvegardes dans $this->backupDir.", $e->excerpt());
+    }
+    return $this->finish('rollback', 'Échec : ' . $cause->getMessage() . ' Retour à l\'état précédent effectué.', $cause->excerpt());
+  }
+
+  /**
+   * Joue les tests HTTP ; un test déjà en échec avant la mise à jour est ignoré.
+   *
+   * @return list<string>
+   *   Tests en échec, en mode $baseline ; sinon une Failure est levée au premier échec.
+   */
+  private function smoke(bool $baseline = FALSE): array {
+    $failed = [];
+    foreach ($this->smokeTests() as $label => $test) {
+      if (!$baseline && in_array($label, $this->brokenBefore, TRUE)) {
+        continue;
+      }
+      [$status, $output] = $test();
+      $this->log->line("Test $label : HTTP $status");
+      if ($status === 0 || $status >= 500) {
+        if (!$baseline) {
+          throw new Failure("Le test de $label répond $status.", $output);
+        }
+        $failed[] = $label;
+      }
+    }
+    return $failed;
+  }
+
+  /**
+   * @return array<string, callable(): array{int, string}>
+   */
+  private function smokeTests(): array {
+    $tests = [];
+    foreach ($this->sites as $uri) {
+      foreach ((array) $this->settings['smoke_paths'] as $path) {
+        $tests[$path . ($uri !== NULL ? " ($uri)" : '')] = function () use ($uri, $path): array {
+          $code = sprintf('$u = \Drupal\Core\Url::fromUserInput(%s)->setAbsolute()->toString(); echo "\nNAU_STATUS:", \Drupal::service("http_kernel")->handle(\Symfony\Component\HttpFoundation\Request::create($u))->getStatusCode();', var_export($path, TRUE));
+          [, $out] = $this->p->drush($uri, ['php:eval', $code], FALSE);
+          return [preg_match('/NAU_STATUS:(\d+)/', $out, $m) ? (int) $m[1] : 0, $out];
+        };
+      }
+    }
+    foreach ((array) $this->settings['smoke_urls'] as $url) {
+      $tests[$url] = function () use ($url): array {
+        [$status, $body] = Http::request('GET', $url);
+        return [$status, mb_substr(strip_tags($body), 0, 2000)];
+      };
+    }
+    return $tests;
+  }
+
+  /**
+   * @return array<string, string>
+   *   Élément de config en écart => site concerné.
+   */
+  private function configStatus(): array {
+    $drift = [];
+    foreach ($this->sites as $uri) {
+      [$code, $out] = $this->p->drush($uri, ['config:status', '--format=json'], FALSE);
+      foreach ($code === 0 ? (json_decode($out, TRUE) ?: []) : [] as $name => $info) {
+        $drift[$name . ' : ' . ($info['state'] ?? '')] = $uri ?? 'défaut';
+      }
+    }
+    return $drift;
+  }
+
+  private function setMaintenance(bool $on): void {
+    if (!$this->settings['maintenance_mode']) {
+      return;
+    }
+    foreach ($this->sites as $uri) {
+      $this->p->drushOrFail($uri, ['state:set', 'system.maintenance_mode', $on ? '1' : '0', '--input-format=integer'], 'Mode maintenance');
+    }
+  }
+
+  private function restoreMaintenance(): void {
+    foreach ($this->sites as $i => $uri) {
+      $this->p->drush($uri, ['state:set', 'system.maintenance_mode', !empty($this->maintenance[$i]) ? '1' : '0', '--input-format=integer']);
+    }
+  }
+
+  private function restoreFiles(): void {
+    foreach (glob("$this->backupDir/*.json") ?: [] as $file) {
+      copy($file, $this->p->root . '/' . basename($file));
+    }
+    if (is_file("$this->backupDir/composer.lock")) {
+      copy("$this->backupDir/composer.lock", $this->p->root . '/composer.lock');
+    }
+  }
+
+  // Sans dump, rien n'a été appliqué : la sauvegarde n'a pas d'utilité.
+  private function discardUnusedBackup(): void {
+    if (isset($this->backupDir) && !glob("$this->backupDir/db-*")) {
+      Project::remove($this->backupDir);
+    }
+  }
+
+  private function saveLast(): void {
+    foreach ($this->p->lockFiles() as $file) {
+      if ($file !== 'composer.json') {
+        copy($this->p->root . "/$file", "{$this->p->workDir}/last/$file");
+      }
+    }
+  }
+
+  private function finish(string $status, string $summary, string $excerpt = ''): int {
+    $this->log->line("[$status] $summary");
+    $this->discardUnusedBackup();
+    $entry = [
+      'time' => time(),
+      'command' => 'run',
+      'status' => $status,
+      'summary' => $summary,
+      'changes' => array_map(Lock::describe(...), $this->changes),
+      'held' => array_map(fn ($n, $v) => "$n $v", array_keys($this->held), $this->held),
+      'warnings' => $this->warnings,
+    ];
+    try {
+      $this->p->recordHistory($entry);
+    }
+    catch (\Throwable $e) {
+      $this->log->line('Historique non enregistré : ' . $e->getMessage());
+    }
+    if ($status !== 'uptodate') {
+      $this->p->notify(...$this->finishMessage($entry, $excerpt));
+    }
+    return in_array($status, ['success', 'uptodate', 'held'], TRUE) ? 0 : 1;
+  }
+
+  private function finishMessage(array $entry, string $excerpt): array {
+    $icon = ['success' => '✅', 'held' => '⏳', 'blocked' => '🛑', 'rollback' => '↩️', 'error' => '❌', 'critical' => '🚨'][$entry['status']] ?? 'ℹ️';
+    $lines = ["$icon **" . $this->p->label() . '** — ' . $entry['summary']];
+    $attachment = '';
+    if ($this->changes && $entry['status'] !== 'blocked') {
+      $root = Lock::read($this->p->root . '/composer.json');
+      $direct = ($root['require'] ?? []) + ($root['require-dev'] ?? []);
+      $main = array_filter($this->changes, fn ($c) => $c['drupal'] || isset($direct[$c['name']]));
+      if ($main) {
+        $lines[] = "```\n" . implode("\n", array_map(Lock::describe(...), $main)) . "\n```";
+      }
+      $libraries = count($this->changes) - count($main);
+      if ($libraries) {
+        $lines[] = "+ $libraries bibliothèque(s) transitive(s), liste complète jointe.";
+        $attachment = implode("\n", $entry['changes']);
+      }
+    }
+    if ($entry['held']) {
+      $lines[] = '⏳ Retenus (publiés il y a moins de ' . $this->settings['min_release_age'] . ' j) : ' . implode(', ', $entry['held']);
+    }
+    foreach ($entry['warnings'] as $warning) {
+      $lines[] = "⚠️ $warning";
+    }
+    if ($excerpt !== '') {
+      $lines[] = "```\n$excerpt\n```";
+    }
+    return [implode("\n", $lines), $attachment];
+  }
+
+}
+
+/**
+ * Au déploiement, choisit le lock à installer sans faire reculer un paquet.
+ *
+ * vendor/ (non versionné) porte les versions posées par les mises à jour
+ * nocturnes ; le composer.lock du dépôt, lui, est en retard.
+ */
+final class Reconciler {
+
+  public function __construct(private Project $p, private Logger $log) {}
+
+  public function run(): int {
+    $installed = Lock::installed($this->p->vendorDir);
+    if ($installed === NULL) {
+      $this->log->line('vendor/ absent : rien à réconcilier.');
+      return 0;
+    }
+    $lockFile = $this->p->root . '/composer.lock';
+    $repo = Lock::read($lockFile);
+    $lower = $this->lower($repo, $installed);
+    if (!$lower) {
+      $this->log->line('Aucun paquet ne recule : lock du dépôt conservé.');
+      $this->saveLast();
+      return 0;
+    }
+
+    $last = $this->p->workDir . '/last/composer.lock';
+    if (is_file($last)) {
+      $saved = Lock::read($last);
+      if (($saved['content-hash'] ?? '') === ($repo['content-hash'] ?? NULL) && !$this->lower($saved, $installed) && !$this->higher($repo, $saved)) {
+        foreach (['composer.lock', PATCHES_LOCK] as $file) {
+          if (is_file($this->p->workDir . "/last/$file")) {
+            copy($this->p->workDir . "/last/$file", $this->p->root . "/$file");
+          }
+        }
+        $this->log->line('Dépendances inchangées dans le dépôt : lock du serveur restauré (' . count($lower) . ' paquet(s) plus récents que le dépôt).');
+        return 0;
+      }
+    }
+
+    $backup = file_get_contents($lockFile);
+    $args = ['update', '--no-install', '--no-scripts', '--no-interaction', '--no-progress'];
+    foreach ($lower as $name => $version) {
+      $args[] = "$name:$version";
+    }
+    [$code] = $this->p->composer($args);
+    if ($code !== 0) {
+      [$code] = $this->p->composer([...$args, '--with-dependencies']);
+    }
+    if ($code !== 0) {
+      file_put_contents($lockFile, $backup);
+      return $this->warn('Impossible de conserver les versions du serveur : le lock du dépôt est installé tel quel, ' . count($lower) . ' paquet(s) reculent : ' . $this->list($lower) . '.');
+    }
+    $remaining = $this->lower(Lock::read($lockFile), $installed);
+    $this->saveLast();
+    if ($remaining) {
+      return $this->warn('Les contraintes du dépôt imposent un recul de version : ' . $this->list($remaining) . '.');
+    }
+    $this->log->line('Lock du dépôt complété : ' . count($lower) . ' paquet(s) maintenus à la version du serveur.');
+    return 0;
+  }
+
+  /**
+   * @return array<string, string>
+   *   Paquets dont le lock propose une version inférieure à celle installée.
+   */
+  private function lower(array $lock, array $installed): array {
+    $out = [];
+    foreach (Lock::packages($lock, $installed['dev']) as $name => $info) {
+      $current = $installed['versions'][$name] ?? NULL;
+      if ($current !== NULL && Lock::isLower($info['version'], $current)) {
+        $out[$name] = $current;
+      }
+    }
+    return $out;
+  }
+
+  private function higher(array $lock, array $reference): bool {
+    $ref = Lock::packages($reference);
+    foreach (Lock::packages($lock) as $name => $info) {
+      if (isset($ref[$name]) && Lock::isLower($ref[$name]['version'], $info['version'])) {
+        return TRUE;
+      }
+    }
+    return FALSE;
+  }
+
+  private function list(array $packages): string {
+    return implode(', ', array_map(fn ($n, $v) => "$n (serveur $v)", array_keys($packages), $packages));
+  }
+
+  private function saveLast(): void {
+    foreach (['composer.lock', PATCHES_LOCK] as $file) {
+      if (is_file($this->p->root . "/$file")) {
+        copy($this->p->root . "/$file", $this->p->workDir . "/last/$file");
+      }
+    }
+  }
+
+  // Ne fait pas échouer le déploiement : un recul de version reste installable.
+  private function warn(string $message): int {
+    $this->log->line("ATTENTION : $message");
+    try {
+      $this->p->notify('⚠️ **' . $this->p->label() . "** — Déploiement : $message");
+      $this->p->recordHistory(['time' => time(), 'command' => 'reconcile', 'status' => 'warning', 'summary' => $message, 'changes' => [], 'held' => [], 'warnings' => []]);
+    }
+    catch (\Throwable) {
+    }
+    return 0;
+  }
+
+}
+
+function usage(): string {
+  return <<<TXT
+  Usage : drupal-autoupdate [commande] [options]
+
+  Commandes :
+    run          Mise à jour (défaut) : mineures et patchs, retour arrière si échec.
+    check        Vérifie les prérequis sans rien modifier.
+    reconcile    Au déploiement, après la mise à jour du code et avant composer install :
+                 empêche le lock du dépôt de faire reculer les paquets du serveur.
+    notify-test  Envoie un message de test sur le webhook Discord.
+
+  Options :
+    --root=DIR       Racine Composer (détectée sinon).
+    --uri=URI        Site drush qui porte les réglages (multisite).
+    --composer=CMD   Commande Composer (détectée sinon).
+    --force          run : passe outre la case « Activer ».
+    --dry-run        run : calcule et affiche les mises à jour sans les appliquer.
+
+  TXT;
+}
+
+function main(array $argv): int {
+  $command = 'run';
+  $options = [];
+  foreach (array_slice($argv, 1) as $arg) {
+    if (preg_match('/^--([\w-]+)(?:=(.*))?$/', $arg, $m)) {
+      $options[$m[1]] = $m[2] ?? TRUE;
+    }
+    else {
+      $command = $arg;
+    }
+  }
+  if ($command === 'help' || isset($options['help'])) {
+    echo usage();
+    return 0;
+  }
+  if (!in_array($command, ['run', 'check', 'reconcile', 'notify-test'], TRUE)) {
+    fwrite(STDERR, "Commande inconnue : $command\n\n" . usage());
+    return 2;
+  }
+  putenv('COMPOSER_NO_INTERACTION=1');
+
+  $p = new Project(Project::locate(is_string($options['root'] ?? NULL) ? $options['root'] : NULL), is_string($options['uri'] ?? NULL) ? $options['uri'] : NULL, is_string($options['composer'] ?? NULL) ? $options['composer'] : NULL);
+  $p->prepareWorkDir();
+  $log = new Logger($command === 'check' ? NULL : "$p->workDir/logs/" . date('Ymd-His') . "-$command.log");
+  $p->log = $log;
+  $p->prune("$p->workDir/logs", LOGS_KEPT);
+
+  if ($command === 'check') {
+    $results = (new Checker($p))->run();
+    foreach ($results as [$level, $message]) {
+      echo ['ok' => '[OK]        ', 'warn' => '[ATTENTION] ', 'fail' => '[ÉCHEC]     '][$level] . $message . "\n";
+    }
+    return Checker::failures($results) ? 1 : 0;
+  }
+  if ($command === 'notify-test') {
+    $p->notify('🔔 **' . $p->label() . '** — Test de notification des mises à jour automatiques.');
+    $log->line('Message envoyé (si un webhook est renseigné).');
+    return 0;
+  }
+
+  // Un déploiement attend la fin d'une mise à jour nocturne en cours au lieu de passer outre.
+  $lock = fopen("$p->workDir/run.lock", 'c');
+  if (!$lock || !flock($lock, $command === 'reconcile' ? LOCK_EX : LOCK_EX | LOCK_NB)) {
+    $log->line('Une exécution est déjà en cours.');
+    return 0;
+  }
+  return $command === 'reconcile'
+    ? (new Reconciler($p, $log))->run()
+    : (new Runner($p, $log, isset($options['force']), isset($options['dry-run'])))->run();
+}
+
+try {
+  exit(main($argv));
+}
+catch (Failure $e) {
+  fwrite(STDERR, $e->getMessage() . "\n" . $e->excerpt() . "\n");
+  exit(1);
+}

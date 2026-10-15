@@ -1,0 +1,6 @@
+name: 'Mises à jour automatiques'
+type: module
+description: 'Mises à jour Composer nocturnes (mineures et patchs) avec retour arrière et notification Discord.'
+package: Net-Com
+core_version_requirement: ^11.2 || ^12
+configure: netcom_autoupdate.settings

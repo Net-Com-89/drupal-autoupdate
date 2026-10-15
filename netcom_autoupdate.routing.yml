@@ -1,0 +1,7 @@
+netcom_autoupdate.settings:
+  path: '/admin/config/system/autoupdate'
+  defaults:
+    _form: '\Drupal\netcom_autoupdate\Form\SettingsForm'
+    _title: 'Mises à jour automatiques'
+  requirements:
+    _permission: 'administer netcom autoupdate'

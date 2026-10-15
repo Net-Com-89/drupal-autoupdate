@@ -1,0 +1,15 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the netcom_autoupdate module.
+ */
+
+use Drupal\netcom_autoupdate\Settings;
+
+/**
+ * Implements hook_uninstall().
+ */
+function netcom_autoupdate_uninstall(): void {
+  \Drupal::state()->deleteMultiple([Settings::STATE_KEY, Settings::HISTORY_KEY]);
+}

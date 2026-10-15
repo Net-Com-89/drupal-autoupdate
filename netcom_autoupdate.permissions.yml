@@ -1,0 +1,3 @@
+administer netcom autoupdate:
+  title: 'Administrer les mises à jour automatiques'
+  restrict access: true
