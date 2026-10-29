@@ -479,6 +479,11 @@ final class Checker {
     $r[] = $p->settingsFound ? ['ok', 'Réglages lus dans Drupal.'] : ['warn', 'Aucun réglage enregistré : module activé (drush en netcom_autoupdate) et formulaire validé ?'];
     $r[] = $settings['enabled'] ? ['ok', 'Mises à jour automatiques activées.'] : ['warn', 'Mises à jour automatiques désactivées dans les réglages.'];
     $r[] = trim((string) $settings['discord_webhook']) !== '' ? ['ok', 'Webhook Discord renseigné.'] : ['warn', 'Aucun webhook Discord : aucune notification ne partira.'];
+    [, $drupalRoot] = $p->drush($p->uri, ['status', '--field=root'], FALSE);
+    $siteDirs = array_map(fn ($f) => basename(dirname($f)), glob(trim($drupalRoot) . '/sites/*/settings.php') ?: []);
+    if (count($siteDirs) > count($p->sites())) {
+      $r[] = ['fail', 'Multisite : ' . count($siteDirs) . ' sites (' . implode(', ', $siteDirs) . '), ' . count($p->sites()) . ' dans le réglage « Sites » : updatedb ne serait pas joué sur les autres. Y saisir une URI drush par site.'];
+    }
     foreach ($p->sites() as $uri) {
       $name = $uri ?? 'site par défaut';
       [$code, $out] = $p->drush($uri, ['status', '--field=bootstrap'], FALSE);
@@ -830,7 +835,9 @@ final class Runner {
     foreach ($this->sites as $uri) {
       foreach ((array) $this->settings['smoke_paths'] as $path) {
         $tests[$path . ($uri !== NULL ? " ($uri)" : '')] = function () use ($uri, $path): array {
-          $code = sprintf('$u = \Drupal\Core\Url::fromUserInput(%s)->setAbsolute()->toString(); echo "\nNAU_STATUS:", \Drupal::service("http_kernel")->handle(\Symfony\Component\HttpFoundation\Request::create($u))->getStatusCode();', var_export($path, TRUE));
+          // SCRIPT_NAME porte le chemin de base d'un multisite par chemin (/actus) : sans lui, il
+          // reste dans le chemin demandé, aucune route ne correspond et Drupal redirige.
+          $code = sprintf('$c = \Drupal::request(); $b = $c->getBaseUrl(); $r = \Symfony\Component\HttpFoundation\Request::create($c->getSchemeAndHttpHost() . $b . %s, "GET", [], [], [], ["SCRIPT_NAME" => $b . "/index.php", "SCRIPT_FILENAME" => DRUPAL_ROOT . "/index.php"]); echo "\nNAU_STATUS:", \Drupal::service("http_kernel")->handle($r)->getStatusCode();', var_export($path, TRUE));
           [, $out] = $this->p->drush($uri, ['php:eval', $code], FALSE);
           return [preg_match('/NAU_STATUS:(\d+)/', $out, $m) ? (int) $m[1] : 0, $out];
         };

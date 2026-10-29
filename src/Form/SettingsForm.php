@@ -68,7 +68,7 @@ final class SettingsForm extends FormBase {
       '#title' => $this->t('Sites (multisite)'),
       '#default_value' => implode("\n", $settings['sites']),
       '#rows' => 3,
-      '#description' => $this->t('Une URI drush par ligne, site par défaut compris (ex. https://exemple.fr et https://exemple.fr/actus). Vide : ce site uniquement.'),
+      '#description' => $this->t('Obligatoire en multisite : une URI drush par ligne, site par défaut compris (ex. https://exemple.fr et https://exemple.fr/actus), sinon updatedb ne serait joué que sur ce site. Vide : ce site uniquement.'),
     ];
     $form['smoke_paths'] = [
       '#type' => 'textarea',
