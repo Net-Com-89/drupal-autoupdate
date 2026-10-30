@@ -133,11 +133,15 @@ fi
 ```
 
 **Déploiement manuel** : `git pull` refuse de s'exécuter tant que `composer.lock` est modifié
-localement. La séquence devient :
+localement. Une mise à jour du core modifie aussi les fichiers de scaffold versionnés
+(`web/.htaccess`, `web/sites/example.settings.local.php`, `web/robots.txt`…) : `git status` les
+liste. Les remettre à l'état du dépôt ne perd rien, `composer install` les réécrit. La séquence
+devient :
 
 ```
 git checkout -- composer.json composer.lock <dossier(s) de config sync>
 git checkout -- patches.lock.json 2>/dev/null   # si le projet en a un
+git checkout -- <fichiers de scaffold listés par git status>
 git pull
 vendor/bin/drupal-autoupdate reconcile
 composer install --no-dev
