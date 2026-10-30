@@ -26,7 +26,7 @@ final class Settings {
     'discord_webhook' => '',
     'min_release_age' => 3,
     'sites' => [],
-    'smoke_paths' => ['/'],
+    'smoke_paths' => ['/user/login'],
     'smoke_urls' => [],
     'maintenance_mode' => TRUE,
     'keep_backups' => 3,

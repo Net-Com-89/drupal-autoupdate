@@ -75,7 +75,7 @@ final class SettingsForm extends FormBase {
       '#title' => $this->t('Chemins testés après mise à jour'),
       '#default_value' => implode("\n", $settings['smoke_paths']),
       '#rows' => 3,
-      '#description' => $this->t('Un chemin par ligne, testé sur chaque site par une requête interne (sans réseau). Une réponse 500 ou plus déclenche le retour arrière.'),
+      '#description' => $this->t('Un chemin par ligne, testé sur chaque site par une requête interne (sans réseau). Une réponse 500 ou plus déclenche le retour arrière. Choisir une page réellement rendue en anonyme (<code>/user/login</code>) : une redirection ou un 401/403 ne teste presque rien.'),
     ];
     $form['smoke_urls'] = [
       '#type' => 'textarea',
@@ -135,7 +135,7 @@ final class SettingsForm extends FormBase {
       'discord_webhook' => trim((string) $form_state->getValue('discord_webhook')),
       'min_release_age' => (int) $form_state->getValue('min_release_age'),
       'sites' => self::lines($form_state->getValue('sites')),
-      'smoke_paths' => self::lines($form_state->getValue('smoke_paths')) ?: ['/'],
+      'smoke_paths' => self::lines($form_state->getValue('smoke_paths')) ?: ['/user/login'],
       'smoke_urls' => self::lines($form_state->getValue('smoke_urls')),
       'maintenance_mode' => (bool) $form_state->getValue('maintenance_mode'),
       'keep_backups' => max(1, (int) $form_state->getValue('keep_backups')),

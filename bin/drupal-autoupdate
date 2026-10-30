@@ -28,7 +28,7 @@ const DEFAULTS = [
   'discord_webhook' => '',
   'min_release_age' => 3,
   'sites' => [],
-  'smoke_paths' => ['/'],
+  'smoke_paths' => ['/user/login'],
   'smoke_urls' => [],
   'maintenance_mode' => TRUE,
   'keep_backups' => 3,
@@ -566,6 +566,134 @@ final class Checker {
 
 }
 
+/**
+ * Config modifiée par les update hooks, préservée au déploiement tant que le dépôt ne l'a pas reprise.
+ *
+ * .autoupdate/config/<site>.json : nom => [base, value]. base = empreinte de la version du dépôt
+ * au moment de la mise à jour (NULL si absente), value = YAML posé par la mise à jour (NULL si supprimé).
+ */
+final class ConfigGuard {
+
+  public function __construct(private Project $p) {}
+
+  /**
+   * @return array<string, string>|null
+   *   Empreinte de chaque élément de la config active, NULL si drush échoue.
+   */
+  public function hashes(?string $uri): ?array {
+    return $this->eval($uri, '$s = \Drupal::service("config.storage"); $h = []; foreach ($s->listAll() as $n) { $h[$n] = md5(serialize($s->read($n))); } $out = $h;');
+  }
+
+  /**
+   * Protège les éléments modifiés entre $before et $after qui diffèrent du dépôt.
+   *
+   * @return list<string>
+   *   Noms protégés.
+   */
+  public function capture(?string $uri, array $before, array $after): array {
+    $changed = array_keys(array_diff_assoc($after, $before) + array_diff_key($before, $after));
+    if (!$changed) {
+      return [];
+    }
+    $data = $this->eval($uri, self::SYNC_DIR . sprintf('
+      $s = \Drupal::service("config.storage");
+      foreach (%s as $n) {
+        $f = "$dir/$n.yml";
+        $repo = is_file($f) ? \Drupal\Component\Serialization\Yaml::decode(file_get_contents($f)) : NULL;
+        $active = $s->read($n) ?: NULL;
+        $out["items"][$n] = ["base" => $repo === NULL ? NULL : md5(serialize($repo)), "same" => $repo == $active, "value" => $active === NULL ? NULL : \Drupal\Component\Serialization\Yaml::encode($active)];
+      }', var_export($changed, TRUE)));
+    if (empty($data['dir'])) {
+      return [];
+    }
+    $store = $this->load($uri);
+    $protected = [];
+    foreach ($data['items'] ?? [] as $name => $item) {
+      if ($item['same']) {
+        unset($store['items'][$name]);
+        continue;
+      }
+      // Déjà protégé : la base reste la version du dépôt d'origine, le fichier ayant été réécrit depuis.
+      $store['items'][$name] = ['base' => array_key_exists($name, $store['items'] ?? []) ? $store['items'][$name]['base'] : $item['base'], 'value' => $item['value']];
+      $protected[] = $name;
+    }
+    $store['dir'] = $data['dir'];
+    $this->save($uri, $store);
+    return $protected;
+  }
+
+  /**
+   * Réécrit dans le dépôt les éléments protégés, ou lève la protection quand le dépôt a repris la main.
+   *
+   * @return array{kept: list<string>, adopted: list<string>, overridden: list<string>}
+   */
+  public function restore(?string $uri): array {
+    $file = $this->file($uri);
+    $store = $this->load($uri);
+    if (empty($store['items'])) {
+      return ['kept' => [], 'adopted' => [], 'overridden' => []];
+    }
+    $data = $this->eval($uri, self::SYNC_DIR . sprintf('
+      $store = json_decode(file_get_contents(%s), TRUE);
+      $out += ["kept" => [], "adopted" => [], "overridden" => []];
+      foreach ($store["items"] as $n => $item) {
+        $f = "$dir/$n.yml";
+        $repo = is_file($f) ? \Drupal\Component\Serialization\Yaml::decode(file_get_contents($f)) : NULL;
+        $value = $item["value"] === NULL ? NULL : \Drupal\Component\Serialization\Yaml::decode($item["value"]);
+        if ($repo == $value) {
+          $out["adopted"][] = $n;
+        }
+        elseif (($repo === NULL ? NULL : md5(serialize($repo))) === $item["base"]) {
+          $item["value"] === NULL ? unlink($f) : file_put_contents($f, $item["value"]);
+          $out["kept"][] = $n;
+        }
+        else {
+          $out["overridden"][] = $n;
+        }
+      }', var_export($file, TRUE)));
+    if ($data === NULL || empty($data['dir'])) {
+      throw new Failure("Config protégée non restaurée ($file) : drush a échoué.");
+    }
+    foreach ([...$data['adopted'], ...$data['overridden']] as $name) {
+      unset($store['items'][$name]);
+    }
+    $this->save($uri, $store);
+    return ['kept' => $data['kept'], 'adopted' => $data['adopted'], 'overridden' => $data['overridden']];
+  }
+
+  private const SYNC_DIR = '
+    $dir = \Drupal\Core\Site\Settings::get("config_sync_directory");
+    if (!$dir) { echo "\nNAU_JSON:null"; return; }
+    $dir = realpath($dir[0] === "/" ? $dir : DRUPAL_ROOT . "/" . $dir) ?: $dir;
+    $out = ["dir" => $dir];';
+
+  private function eval(?string $uri, string $code): ?array {
+    [, $out] = $this->p->drush($uri, ['php:eval', '$out = []; ' . $code . ' echo "\nNAU_JSON:", json_encode($out);'], FALSE);
+    $pos = strrpos($out, 'NAU_JSON:');
+    $data = $pos === FALSE ? NULL : json_decode(trim(substr($out, $pos + 9)), TRUE);
+    return is_array($data) ? $data : NULL;
+  }
+
+  private function file(?string $uri): string {
+    return $this->p->workDir . '/config/' . preg_replace('/[^a-z0-9]+/i', '_', $uri ?? 'default') . '.json';
+  }
+
+  private function load(?string $uri): array {
+    $file = $this->file($uri);
+    return is_file($file) ? (json_decode((string) file_get_contents($file), TRUE) ?: []) : [];
+  }
+
+  private function save(?string $uri, array $store): void {
+    @mkdir(dirname($this->file($uri)), 0750, TRUE);
+    if (empty($store['items'])) {
+      @unlink($this->file($uri));
+      return;
+    }
+    file_put_contents($this->file($uri), json_encode($store, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+  }
+
+}
+
 final class Runner {
 
   private array $settings;
@@ -718,7 +846,11 @@ final class Runner {
   }
 
   private function apply(): int {
-    $driftBefore = $this->configStatus();
+    $guard = new ConfigGuard($this->p);
+    $configBefore = [];
+    foreach ($this->sites as $i => $uri) {
+      $configBefore[$i] = $guard->hashes($uri);
+    }
     $this->brokenBefore = $this->smoke(TRUE);
     if ($this->brokenBefore) {
       $this->warnings[] = 'Déjà en échec avant la mise à jour, non pris en compte : ' . implode(', ', $this->brokenBefore) . '.';
@@ -756,12 +888,17 @@ final class Runner {
       return $this->rollback($e);
     }
 
-    $drift = [];
-    foreach (array_diff_key($this->configStatus(), $driftBefore) as $name => $site) {
-      $drift[$site][] = $name;
-    }
-    foreach ($drift as $site => $names) {
-      $this->warnings[] = "Config modifiée par les update hooks ($site), à exporter en dev avant le prochain config:import : " . implode(', ', $names) . '.';
+    foreach ($this->sites as $i => $uri) {
+      $after = $configBefore[$i] === NULL ? NULL : $guard->hashes($uri);
+      $site = $uri ?? 'défaut';
+      if ($after === NULL) {
+        $this->warnings[] = "Config du site $site non relevée (drush) : une modification faite par les update hooks serait annulée par le prochain config:import.";
+        continue;
+      }
+      $protected = $guard->capture($uri, $configBefore[$i], $after);
+      if ($protected) {
+        $this->warnings[] = "Config modifiée par les update hooks ($site) : " . implode(', ', $protected) . '. Préservée aux déploiements par reconcile ; à exporter en dev pour la versionner.';
+      }
     }
     $remaining = $this->vulnerable();
     if ($remaining) {
@@ -850,21 +987,6 @@ final class Runner {
       };
     }
     return $tests;
-  }
-
-  /**
-   * @return array<string, string>
-   *   Élément de config en écart => site concerné.
-   */
-  private function configStatus(): array {
-    $drift = [];
-    foreach ($this->sites as $uri) {
-      [$code, $out] = $this->p->drush($uri, ['config:status', '--format=json'], FALSE);
-      foreach ($code === 0 ? (json_decode($out, TRUE) ?: []) : [] as $name => $info) {
-        $drift[$name . ' : ' . ($info['state'] ?? '')] = $uri ?? 'défaut';
-      }
-    }
-    return $drift;
   }
 
   private function setMaintenance(bool $on): void {
@@ -962,16 +1084,45 @@ final class Runner {
 }
 
 /**
- * Au déploiement, choisit le lock à installer sans faire reculer un paquet.
+ * Au déploiement, empêche le dépôt de défaire ce qu'ont posé les mises à jour nocturnes.
  *
- * vendor/ (non versionné) porte les versions posées par les mises à jour
- * nocturnes ; le composer.lock du dépôt, lui, est en retard.
+ * vendor/ (non versionné) porte les versions installées et la base la config modifiée par
+ * les update hooks ; le composer.lock et la config du dépôt, eux, sont en retard.
  */
 final class Reconciler {
 
   public function __construct(private Project $p, private Logger $log) {}
 
   public function run(): int {
+    $code = $this->lock();
+    $this->config();
+    return $code;
+  }
+
+  private function config(): void {
+    $guard = new ConfigGuard($this->p);
+    foreach ($this->p->sites() as $uri) {
+      $site = $uri ?? 'défaut';
+      try {
+        $result = $guard->restore($uri);
+      }
+      catch (Failure $e) {
+        $this->warn($e->getMessage() . " Le config:import de ce déploiement annulera la config posée par les mises à jour ($site).");
+        continue;
+      }
+      if ($result['kept']) {
+        $this->log->line("Config posée par les mises à jour, préservée ($site) : " . implode(', ', $result['kept']) . '.');
+      }
+      if ($result['adopted']) {
+        $this->log->line("Config désormais versionnée, protection levée ($site) : " . implode(', ', $result['adopted']) . '.');
+      }
+      if ($result['overridden']) {
+        $this->warn("La version du dépôt remplace celle posée par les mises à jour ($site) : " . implode(', ', $result['overridden']) . '.');
+      }
+    }
+  }
+
+  private function lock(): int {
     $installed = Lock::installed($this->p->vendorDir);
     if ($installed === NULL) {
       $this->log->line('vendor/ absent : rien à réconcilier.');
@@ -1112,6 +1263,11 @@ function main(array $argv): int {
   if (!in_array($command, ['run', 'check', 'reconcile', 'notify-test'], TRUE)) {
     fwrite(STDERR, "Commande inconnue : $command\n\n" . usage());
     return 2;
+  }
+  // Hébergements mutualisés : sans proc_open, ni composer ni drush ne peuvent être lancés.
+  if (!function_exists('proc_open')) {
+    fwrite(STDERR, "proc_open est désactivé (disable_functions) : drupal-autoupdate ne peut lancer ni composer ni drush.\n");
+    return 1;
   }
   putenv('COMPOSER_NO_INTERACTION=1');
 
