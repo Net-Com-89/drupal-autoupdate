@@ -88,8 +88,16 @@ contient `composer.json` (parfois un sous-dossier `drupal/`).
    0 23 * * * cd /var/www/projet && vendor/bin/drupal-autoupdate >/dev/null 2>&1
 
    # Avec Docker (le dossier de travail de l'image drupal est la racine Composer)
-   0 23 * * * docker exec -T projet-drupal-1 vendor/bin/drupal-autoupdate >/dev/null 2>&1
+   0 23 * * * docker exec projet-drupal-1 vendor/bin/drupal-autoupdate >/dev/null 2>&1
    ```
+
+   ⚠️ `-T` n'existe que pour `docker compose exec` : `docker exec -T` échoue, et en silence avec la
+   redirection vers `/dev/null`.
+
+   Sans `crontab` sur le serveur, un timer systemd fait l'affaire : un service `Type=oneshot` avec
+   `User=` un membre du groupe `docker` et la commande ci-dessus en `ExecStart` (chemin absolu de
+   `docker`), plus un timer `OnCalendar=*-*-* 23:00` et `Persistent=false`, pour qu'un redémarrage
+   ne lance pas la maintenance en pleine journée.
 
    L'heure est libre. Si le rapport d'état ne voit passer aucune exécution pendant deux jours, il le
    signale.
