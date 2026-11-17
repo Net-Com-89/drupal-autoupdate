@@ -38,6 +38,7 @@ inutilisable en l'état.
 | Composer est disponible là où tourne l'outil | il calcule et installe les mises à jour | `composer --version` (sinon option `--composer`) |
 | Drupal 11.2+, Composer 2.4+, drush dans `vendor/bin` | API utilisées | `check` |
 | Sortie Internet, ou proxy déclaré dans l'environnement (`http_proxy`, `https_proxy`) **du conteneur ou du shell du cron** | Packagist, drupal.org et Discord | `env \| grep -i proxy` à l'endroit où tournera la commande |
+| `memory_limit` PHP **sous cron** de 512 Mo ou plus | `updatedb` dépasse souvent 128 Mo, alors que `check` et `--dry-run` passent | `php -r 'echo ini_get("memory_limit");'` dans l'environnement du cron, pas dans un shell interactif |
 | Comment le code arrive sur le serveur (script après `git reset --hard`, `git pull` manuel…) | il faut y insérer `reconcile` | script de déploiement, workflow de CI |
 | Multisite : liste des sites et leurs URIs drush | `updatedb` doit être joué sur chacun | `web/sites/*/settings.php`, `sites.php` |
 
@@ -98,6 +99,17 @@ contient `composer.json` (parfois un sous-dossier `drupal/`).
    `User=` un membre du groupe `docker` et la commande ci-dessus en `ExecStart` (chemin absolu de
    `docker`), plus un timer `OnCalendar=*-*-* 23:00` et `Persistent=false`, pour qu'un redémarrage
    ne lance pas la maintenance en pleine journée.
+
+   **Plesk** : sous cron, `/opt/plesk/php/<version>/bin/php` charge le `php.ini` global de Plesk
+   (128 Mo), pas celui du vhost que phpenv applique en shell. `PHPRC`, hérité par composer et
+   drush, rétablit celui du vhost. PHP va en tête du `PATH`, car composer et drush passent par
+   `env php` et `/usr/bin/php` peut être une autre version :
+
+   ```
+   # /etc/cron.d/projet-autoupdate
+   PATH=/opt/plesk/php/8.4/bin:/usr/local/bin:/usr/bin:/bin
+   0 2 * * * utilisateur_du_vhost cd /var/www/vhosts/domaine/httpdocs && PHPRC=/var/www/vhosts/system/domaine/etc/php.ini php vendor/bin/drupal-autoupdate 2>&1 | logger -t projet-autoupdate
+   ```
 
    L'heure est libre. Si le rapport d'état ne voit passer aucune exécution pendant deux jours, il le
    signale.
