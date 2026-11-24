@@ -88,6 +88,7 @@ final class SettingsForm extends FormBase {
       '#type' => 'checkbox',
       '#title' => $this->t('Mode maintenance pendant la mise à jour'),
       '#default_value' => $settings['maintenance_mode'],
+      '#description' => $this->t('Le site répond 503 à tous, administrateurs compris, par la barrière de <code>settings.php</code> (voir le README). Toujours posée pendant une restauration, même décoché.'),
     ];
     $form['keep_backups'] = [
       '#type' => 'number',

@@ -19,6 +19,12 @@ const HISTORY_KEY = 'netcom_autoupdate.history';
 const HISTORY_SIZE = 30;
 const LOGS_KEPT = 30;
 const PATCHES_LOCK = 'patches.lock.json';
+// Drapeau testé par settings.php (README § Barrière) : 503 avant tout accès à la base.
+const BARRIER = 'maintenance';
+// Sauvegardées sans données : vides après restauration, rien qu'une requête concurrente puisse dupliquer.
+const STRUCTURE_ONLY = 'cache_*,cachetags,sessions,semaphore,watchdog';
+const RETRIES = 3;
+const RETRY_DELAY = 5;
 
 // Miroir de \Drupal\netcom_autoupdate\Settings::DEFAULTS : ce fichier ne peut rien inclure.
 const DEFAULTS = [
@@ -307,9 +313,56 @@ final class Project {
         throw new Failure("Impossible de créer $dir");
       }
     }
+    // Traversable sans être listable : l'utilisateur du serveur web (www-data en Docker) doit voir la barrière.
+    @chmod($this->workDir, 0711);
     // Le dossier contient des dumps de base : jamais versionné, jamais servi.
     @file_put_contents("$this->workDir/.gitignore", "*\n");
     @file_put_contents("$this->workDir/.htaccess", "Require all denied\n");
+  }
+
+  public function barrierUp(): bool {
+    return is_file("$this->workDir/" . BARRIER);
+  }
+
+  public function barrier(bool $up): void {
+    if (!$up) {
+      @unlink("$this->workDir/" . BARRIER);
+    }
+    elseif (file_put_contents("$this->workDir/" . BARRIER, date('c') . "\n") === FALSE) {
+      throw new Failure("Pose de la barrière de maintenance impossible ($this->workDir/" . BARRIER . ').');
+    }
+  }
+
+  /**
+   * @return list<string>
+   */
+  public function tables(?string $uri): array {
+    $out = $this->drushOrFail($uri, ['sql:query', "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"], 'Liste des tables', FALSE);
+    return array_values(array_filter(array_map('trim', explode("\n", $out))));
+  }
+
+  /**
+   * @return list<string>|null
+   *   Tables recréées par le dump, NULL s'il est illisible ou tronqué.
+   */
+  public static function dumpTables(string $file): ?array {
+    $handle = @gzopen($file, 'rb');
+    if (!$handle) {
+      return NULL;
+    }
+    $tables = [];
+    $last = '';
+    while (($line = gzgets($handle)) !== FALSE) {
+      if (str_starts_with($line, 'CREATE TABLE `')) {
+        $tables[] = substr($line, 14, (int) strpos($line, '`', 14) - 14);
+      }
+      if ($line !== "\n") {
+        $last = $line;
+      }
+    }
+    gzclose($handle);
+    // mysqldump n'écrit cette ligne qu'à la fin d'un dump complet.
+    return str_starts_with($last, '-- Dump completed') ? $tables : NULL;
   }
 
   public function composer(array $args, bool $echo = TRUE): array {
@@ -480,10 +533,12 @@ final class Checker {
     $r[] = $settings['enabled'] ? ['ok', 'Mises à jour automatiques activées.'] : ['warn', 'Mises à jour automatiques désactivées dans les réglages.'];
     $r[] = trim((string) $settings['discord_webhook']) !== '' ? ['ok', 'Webhook Discord renseigné.'] : ['warn', 'Aucun webhook Discord : aucune notification ne partira.'];
     [, $drupalRoot] = $p->drush($p->uri, ['status', '--field=root'], FALSE);
-    $siteDirs = array_map(fn ($f) => basename(dirname($f)), glob(trim($drupalRoot) . '/sites/*/settings.php') ?: []);
+    $drupalRoot = trim($drupalRoot);
+    $siteDirs = array_map(fn ($f) => basename(dirname($f)), glob("$drupalRoot/sites/*/settings.php") ?: []);
     if (count($siteDirs) > count($p->sites())) {
       $r[] = ['fail', 'Multisite : ' . count($siteDirs) . ' sites (' . implode(', ', $siteDirs) . '), ' . count($p->sites()) . ' dans le réglage « Sites » : updatedb ne serait pas joué sur les autres. Y saisir une URI drush par site.'];
     }
+    $r = [...$r, ...$this->barrier($drupalRoot, $siteDirs)];
     foreach ($p->sites() as $uri) {
       $name = $uri ?? 'site par défaut';
       [$code, $out] = $p->drush($uri, ['status', '--field=bootstrap'], FALSE);
@@ -492,10 +547,11 @@ final class Checker {
         continue;
       }
       [, $driver] = $p->drush($uri, ['status', '--field=db-driver'], FALSE);
-      $tools = ['mysql' => ['mysqldump', 'mariadb-dump'], 'pgsql' => ['pg_dump'], 'sqlite' => ['sqlite3']][trim($driver)] ?? [];
-      $r[] = array_filter(array_map(Proc::which(...), $tools))
-        ? ['ok', "Outil de sauvegarde de la base présent ($name)."]
-        : ['fail', "Aucun outil de dump pour la base « " . trim($driver) . " » (" . implode(' ou ', $tools) . ") : impossible de sauvegarder, donc de revenir en arrière ($name)."];
+      $r[] = match (TRUE) {
+        trim($driver) !== 'mysql' => ['fail', 'Base « ' . trim($driver) . " » : le retour arrière ne prend en charge que MySQL/MariaDB ($name)."],
+        (bool) array_filter(array_map(Proc::which(...), ['mysqldump', 'mariadb-dump'])) => ['ok', "Outil de sauvegarde de la base présent ($name)."],
+        default => ['fail', "Ni mysqldump ni mariadb-dump : impossible de sauvegarder, donc de revenir en arrière ($name)."],
+      };
       [$code, $out] = $p->drush($uri, ['config:status', '--format=json'], FALSE);
       $drift = $code === 0 ? (json_decode($out, TRUE) ?: []) : [];
       if ($drift) {
@@ -516,6 +572,32 @@ final class Checker {
 
   public static function failures(array $results): array {
     return array_column(array_filter($results, fn ($r) => $r[0] === 'fail'), 1);
+  }
+
+  // Lecture du code seulement : un test réel couperait le site.
+  private function barrier(string $drupalRoot, array $siteDirs): array {
+    $root = realpath($this->p->root) ?: $this->p->root;
+    $docroot = realpath($drupalRoot) ?: $drupalRoot;
+    if (!$siteDirs) {
+      return [];
+    }
+    if ($docroot !== $root && !str_starts_with($docroot, "$root/")) {
+      return [['fail', "Racine Drupal ($docroot) hors de la racine Composer : chemin de la barrière de maintenance non pris en charge."]];
+    }
+    $levels = substr_count(substr($docroot, strlen($root)), '/');
+    $path = match ($levels) {
+      0 => '$app_root',
+      1 => 'dirname($app_root)',
+      default => "dirname(\$app_root, $levels)",
+    } . " . '/.autoupdate/" . BARRIER . "'";
+    $r = [];
+    foreach ($siteDirs as $dir) {
+      $code = implode('', array_map('file_get_contents', glob("$drupalRoot/sites/$dir/settings*.php") ?: []));
+      if (!str_contains((string) preg_replace('/\s+/', '', $code), (string) preg_replace('/\s+/', '', $path))) {
+        $r[] = ['fail', "Barrière de maintenance absente de sites/$dir/settings.php : sans elle, le trafic web peut faire échouer une restauration de la base et l'installeur est servi. Ajouter en tête le bloc du README § Barrière, avec le chemin $path."];
+      }
+    }
+    return $r ?: [['ok', 'Barrière de maintenance présente dans settings.php.']];
   }
 
   private function lockSync(): array {
@@ -705,6 +787,7 @@ final class Runner {
   private array $warnings = [];
   private array $maintenance = [];
   private array $brokenBefore = [];
+  private array $dumpTables = [];
 
   public function __construct(private Project $p, private Logger $log, private bool $force, private bool $dryRun) {
     $this->runId = date('Ymd-His');
@@ -716,6 +799,8 @@ final class Runner {
       $this->log->line('Désactivé dans les réglages : rien à faire.');
       return 0;
     }
+    // Copies laissées par une restauration interrompue.
+    array_map('unlink', glob("{$this->p->workDir}/restore-*") ?: []);
     $this->sites = $this->p->sites();
     $failures = Checker::failures((new Checker($this->p))->run());
     if ($failures) {
@@ -859,14 +944,18 @@ final class Runner {
       foreach ($this->sites as $i => $uri) {
         $this->maintenance[$i] = trim($this->p->drushOrFail($uri, ['state:get', 'system.maintenance_mode', '--format=string'], 'Lecture du mode maintenance', FALSE)) === '1';
       }
+      if ($this->settings['maintenance_mode']) {
+        $this->p->barrier(TRUE);
+      }
       $this->setMaintenance(TRUE);
       foreach ($this->sites as $i => $uri) {
-        $this->p->drushOrFail($uri, ['sql:dump', '--gzip', "--result-file=$this->backupDir/db-$i.sql"], 'Sauvegarde de la base');
+        $this->backup($i, $uri);
       }
     }
     catch (Failure $e) {
       $this->restoreFiles();
       $this->restoreMaintenance();
+      $this->p->barrier(FALSE);
       return $this->finish('error', 'Sauvegarde impossible, rien n\'a été modifié : ' . $e->getMessage(), $e->excerpt());
     }
 
@@ -881,8 +970,7 @@ final class Runner {
       foreach ($this->sites as $uri) {
         $this->p->drushOrFail($uri, ['cache:rebuild'], 'drush cache:rebuild a échoué');
       }
-      $this->restoreMaintenance();
-      $this->smoke();
+      $this->reopen();
     }
     catch (Failure $e) {
       return $this->rollback($e);
@@ -911,7 +999,13 @@ final class Runner {
 
   private function rollback(Failure $cause): int {
     $this->log->line('ÉCHEC : ' . $cause->getMessage() . ' → retour arrière.');
+    $restored = FALSE;
     try {
+      if (!$this->p->barrierUp()) {
+        $this->p->barrier(TRUE);
+        // Laisse finir les requêtes déjà passées par settings.php.
+        sleep(2 * RETRY_DELAY);
+      }
       foreach ($this->sites as $uri) {
         $this->p->drush($uri, ['state:set', 'system.maintenance_mode', '1', '--input-format=integer']);
       }
@@ -921,34 +1015,96 @@ final class Runner {
         throw new Failure('composer install du lock précédent a échoué.', $out);
       }
       foreach ($this->sites as $i => $uri) {
-        // drush décompresse le fichier sur place : on lui passe une copie pour garder la sauvegarde intacte.
-        $copy = sys_get_temp_dir() . "/nau-restore-$this->runId-$i.sql.gz";
-        copy("$this->backupDir/db-$i.sql.gz", $copy);
-        $this->p->drushOrFail($uri, ['sql:drop', '-y'], 'Vidage de la base');
-        $this->p->drushOrFail($uri, ['sql:query', "--file=$copy"], 'Restauration de la base');
-        @unlink($copy);
-        @unlink(substr($copy, 0, -3));
+        $this->restoreDatabase($i, $uri);
         $this->p->drushOrFail($uri, ['cache:rebuild'], 'drush cache:rebuild a échoué');
       }
-      // Le dump a été pris en maintenance : il faut rétablir l'état d'origine.
-      $this->restoreMaintenance();
-      $this->smoke();
+      $restored = TRUE;
+      // Le dump a été pris en maintenance : reopen() rétablit l'état d'origine.
+      $this->reopen();
     }
     catch (Failure $e) {
-      return $this->finish('critical', 'Échec : ' . $cause->getMessage() . ' Puis échec du retour arrière : ' . $e->getMessage() . " Intervention requise : sauvegardes dans $this->backupDir.", $e->excerpt());
+      // Code et base revenus à l'état d'avant : la barrière ne protège plus rien.
+      if ($restored) {
+        $this->p->barrier(FALSE);
+      }
+      return $this->finish('critical', 'Échec : ' . $cause->getMessage() . ' Puis échec du retour arrière : ' . $e->getMessage() . ($this->p->barrierUp() ? ' Site coupé (503) par la barrière de maintenance.' : '') . " Intervention requise : sauvegardes dans $this->backupDir.", $e->excerpt());
     }
     return $this->finish('rollback', 'Échec : ' . $cause->getMessage() . ' Retour à l\'état précédent effectué.', $cause->excerpt());
+  }
+
+  private function backup(int $i, ?string $uri): void {
+    $file = "$this->backupDir/db-$i.sql";
+    $this->p->drushOrFail($uri, ['sql:dump', '--gzip', '--structure-tables-list=' . STRUCTURE_ONLY, "--result-file=$file"], 'Sauvegarde de la base');
+    $tables = Project::dumpTables("$file.gz");
+    $missing = array_diff($this->p->tables($uri), $tables ?? []);
+    if ($tables === NULL || $missing) {
+      throw new Failure('Sauvegarde de la base incomplète' . ($tables === NULL ? ' (dump tronqué)' : ', tables absentes : ' . implode(', ', $missing)) . '.');
+    }
+    $this->dumpTables[$i] = $tables;
+  }
+
+  // Sans sql:drop : chaque table du dump commence par DROP TABLE IF EXISTS, un import interrompu se rejoue.
+  private function restoreDatabase(int $i, ?string $uri): void {
+    $site = $uri ?? 'site par défaut';
+    $copy = "{$this->p->workDir}/restore-$this->runId-$i.sql.gz";
+    try {
+      for ($attempt = 1; ; $attempt++) {
+        // drush décompresse sur place : copie privée, dont gzip -d reprend le mode.
+        @unlink($copy);
+        $umask = umask(0077);
+        $copied = copy("$this->backupDir/db-$i.sql.gz", $copy);
+        umask($umask);
+        if (!$copied) {
+          throw new Failure("Copie de la sauvegarde impossible : $copy");
+        }
+        [$code, $out] = $this->p->drush($uri, ['sql:query', "--file=$copy"]);
+        if ($code === 0) {
+          break;
+        }
+        if ($attempt === RETRIES) {
+          throw new Failure("Restauration de la base ($site) : $attempt essais en échec.", $out);
+        }
+        $this->log->line("Import en échec (essai $attempt sur " . RETRIES . '), nouvel essai dans ' . RETRY_DELAY . ' s.');
+        sleep(RETRY_DELAY);
+      }
+    }
+    finally {
+      @unlink($copy);
+      @unlink(substr($copy, 0, -3));
+    }
+    $expected = $this->dumpTables[$i];
+    // Les tables créées depuis la sauvegarde (update hooks) ne sont pas dans le dump.
+    $extra = array_diff($this->p->tables($uri), $expected);
+    if ($extra) {
+      $this->p->drushOrFail($uri, ['sql:query', 'DROP TABLE ' . implode(', ', array_map(fn ($t) => '`' . str_replace('`', '``', $t) . '`', $extra))], 'Suppression des tables créées par la mise à jour');
+    }
+    $actual = $this->p->tables($uri);
+    if (count($actual) !== count($expected) || array_diff($expected, $actual)) {
+      throw new Failure("Base restaurée incomplète ($site) : " . count($actual) . ' tables au lieu de ' . count($expected) . '.');
+    }
+    $this->log->line(count($actual) . " tables, comme dans la sauvegarde ($site).");
+  }
+
+  // Tests internes avant de lever la barrière : aucune requête web ne remet alors en cache l'état de maintenance.
+  private function reopen(): void {
+    $this->restoreMaintenance();
+    $this->smoke(FALSE, FALSE);
+    $this->p->barrier(FALSE);
+    $this->smoke(FALSE, TRUE);
   }
 
   /**
    * Joue les tests HTTP ; un test déjà en échec avant la mise à jour est ignoré.
    *
+   * @param bool|null $external
+   *   FALSE : requêtes internes (drush) seules ; TRUE : URLs externes seules ; NULL : toutes.
+   *
    * @return list<string>
    *   Tests en échec, en mode $baseline ; sinon une Failure est levée au premier échec.
    */
-  private function smoke(bool $baseline = FALSE): array {
+  private function smoke(bool $baseline = FALSE, ?bool $external = NULL): array {
     $failed = [];
-    foreach ($this->smokeTests() as $label => $test) {
+    foreach ($this->smokeTests($external) as $label => $test) {
       if (!$baseline && in_array($label, $this->brokenBefore, TRUE)) {
         continue;
       }
@@ -967,9 +1123,9 @@ final class Runner {
   /**
    * @return array<string, callable(): array{int, string}>
    */
-  private function smokeTests(): array {
+  private function smokeTests(?bool $external): array {
     $tests = [];
-    foreach ($this->sites as $uri) {
+    foreach ($external === TRUE ? [] : $this->sites as $uri) {
       foreach ((array) $this->settings['smoke_paths'] as $path) {
         $tests[$path . ($uri !== NULL ? " ($uri)" : '')] = function () use ($uri, $path): array {
           // SCRIPT_NAME porte le chemin de base d'un multisite par chemin (/actus) : sans lui, il
@@ -980,7 +1136,7 @@ final class Runner {
         };
       }
     }
-    foreach ((array) $this->settings['smoke_urls'] as $url) {
+    foreach ($external === FALSE ? [] : (array) $this->settings['smoke_urls'] as $url) {
       $tests[$url] = function () use ($url): array {
         [$status, $body] = Http::request('GET', $url);
         return [$status, mb_substr(strip_tags($body), 0, 2000)];

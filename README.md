@@ -17,10 +17,13 @@ Aucune action humaine n'est nécessaire dans le cas courant. Le serveur prend de
    - aucune version publiée depuis moins de *N* jours (réglage « âge minimal »), sauf si une faille
      de sécurité touche une version installée ;
    - aucun nouveau plugin Composer non autorisé dans `allow-plugins`.
-3. Tests HTTP de référence, mode maintenance, dump de chaque base.
-4. `composer install`, `drush updatedb` et `drush cache:rebuild` sur chaque site, puis sortie du
-   mode maintenance et nouveaux tests HTTP.
-5. **En cas d'échec** : ancien lock réinstallé, bases restaurées, maintenance rétablie.
+3. Tests HTTP de référence, [barrière](#barrière) et mode maintenance, dump de chaque base
+   (caches, sessions, verrous et journal `watchdog` sans leurs données), vérifié complet.
+4. `composer install`, `drush updatedb` et `drush cache:rebuild` sur chaque site, sortie du mode
+   maintenance, tests internes, levée de la barrière, tests des URLs externes.
+5. **En cas d'échec** : barrière, ancien lock réinstallé, bases restaurées sans être vidées au
+   préalable (import rejoué jusqu'à trois fois), tables comparées une à une à la sauvegarde,
+   maintenance rétablie.
 6. **En cas de succès** : relevé de la config modifiée par les update hooks, pour la préserver aux
    déploiements suivants (voir [Déploiement](#déploiement)).
 7. Notification Discord (rien n'est envoyé quand tout est déjà à jour), historique visible dans
@@ -28,7 +31,7 @@ Aucune action humaine n'est nécessaire dans le cas courant. Le serveur prend de
 
 ## Compatibilité : à vérifier avant d'installer
 
-Inspecter le projet sur ces points. Un seul « non » sur les trois premiers rend le module
+Inspecter le projet sur ces points. Un seul « non » sur les quatre premiers rend le module
 inutilisable en l'état.
 
 | Point | Pourquoi | Comment vérifier |
@@ -36,6 +39,7 @@ inutilisable en l'état.
 | Le code vit sur un disque **persistant** du serveur (classique, ou bind mount Docker type `./drupal:/opt/drupal`) | une mise à jour faite dans un code **intégré à l'image** (`COPY` + `composer install` au build) ou dans un `vendor/` **reconstruit par la CI** puis copié est perdue au déploiement ou à la recréation du conteneur suivants | `Dockerfile`, `compose*.yml`, workflow de CI |
 | `proc_open` est autorisé pour le PHP en ligne de commande | l'outil lance composer et drush | `php -r 'var_dump(function_exists("proc_open"));'` |
 | Composer est disponible là où tourne l'outil | il calcule et installe les mises à jour | `composer --version` (sinon option `--composer`) |
+| Base MySQL/MariaDB | seule base que sait restaurer le retour arrière | `drush status --field=db-driver` |
 | Drupal 11.2+, Composer 2.4+, drush dans `vendor/bin` | API utilisées | `check` |
 | Sortie Internet, ou proxy déclaré dans l'environnement (`http_proxy`, `https_proxy`) **du conteneur ou du shell du cron** | Packagist, drupal.org et Discord | `env \| grep -i proxy` à l'endroit où tournera la commande |
 | `memory_limit` PHP **sous cron** de 512 Mo ou plus | `updatedb` dépasse souvent 128 Mo, alors que `check` et `--dry-run` passent | `php -r 'echo ini_get("memory_limit");'` dans l'environnement du cron, pas dans un shell interactif |
@@ -74,7 +78,10 @@ contient `composer.json` (parfois un sous-dossier `drupal/`).
    ppd), ils sont ceux de l'environnement d'origine (environnement, âge minimal, sites, webhook).
    Les revérifier.
 
-4. **Prérequis** :
+4. **Barrière** : ajouter le bloc de la section [Barrière](#barrière) en tête de chaque
+   `settings.php`, le commiter et le déployer.
+
+5. **Prérequis** :
 
    ```
    vendor/bin/drupal-autoupdate check
@@ -82,7 +89,7 @@ contient `composer.json` (parfois un sous-dossier `drupal/`).
 
    Corriger chaque `[ÉCHEC]`. Les `[ATTENTION]` sont informatifs.
 
-5. **Tâche cron** du serveur, lancée avec l'utilisateur **propriétaire du code** (pas `www-data`) :
+6. **Tâche cron** du serveur, lancée avec l'utilisateur **propriétaire du code** (pas `www-data`) :
 
    ```
    # Sans Docker
@@ -114,9 +121,9 @@ contient `composer.json` (parfois un sous-dossier `drupal/`).
    L'heure est libre. Si le rapport d'état ne voit passer aucune exécution pendant deux jours, il le
    signale.
 
-6. **Déploiement** : adapter la procédure (section suivante).
+7. **Déploiement** : adapter la procédure (section suivante).
 
-7. **Vérifier** : `vendor/bin/drupal-autoupdate notify-test`, puis
+8. **Vérifier** : `vendor/bin/drupal-autoupdate notify-test`, puis
    `vendor/bin/drupal-autoupdate run --dry-run`, qui affiche ce qui serait mis à jour sans rien
    modifier.
 
@@ -179,16 +186,47 @@ Chaque cas est notifié sur Discord et enregistré dans l'historique.
 | 🛑 Nouveau plugin Composer à autoriser | un paquet apporte un plugin absent de `allow-plugins` | l'ajouter au `composer.json` du dépôt et déployer |
 | 🛑 Bloquée par le garde-fou | une contrainte de `composer.json` laisse passer une majeure (`*`, `>=`) | resserrer la contrainte (`^`) |
 | ↩️ Échec, retour arrière effectué | `composer install`, `updatedb` ou un test HTTP a échoué, souvent un patch qui ne s'applique plus | corriger en dev, déployer ; la nuit suivante retentera |
-| 🚨 Échec du retour arrière | rarissime : le site est peut-être cassé | restauration manuelle (ci-dessous) |
+| 🚨 Échec du retour arrière | rarissime : le site est peut-être cassé. Si la base n'a pas pu être restaurée, la barrière reste en place (503) | vérifier le site, [restauration manuelle](#restauration-manuelle) si besoin, puis `rm .autoupdate/maintenance` |
 | ❌ Prérequis non remplis | voir `check` | corriger |
+
+## Barrière
+
+Le mode maintenance de Drupal est stocké en base : pendant une restauration, il disparaît avec les
+tables, et une requête web peut écrire dans une table entre sa recréation et son import (doublon de
+clé, import interrompu) ou se voir servir l'installeur. La barrière coupe le trafic web **avant**
+tout accès à la base : tant que `.autoupdate/maintenance` existe, `settings.php` répond 503 à toutes
+les URL (`index.php`, `core/install.php`, `update.php`), administrateurs compris. drush n'est pas
+concerné. Le test est en PHP, il vaut quel que soit le serveur web (Apache, nginx, Plesk, Docker).
+
+En tête de chaque `settings.php` (en multisite, celui de chaque site), juste après `<?php` :
+
+```php
+// drupal-autoupdate : coupe le trafic web pendant une mise à jour ou une restauration (README § Barrière).
+if (PHP_SAPI !== 'cli' && is_file(dirname($app_root) . '/.autoupdate/maintenance')) {
+  http_response_code(503);
+  header('Retry-After: 300');
+  exit('Site en maintenance, merci de revenir dans quelques minutes.');
+}
+```
+
+`dirname($app_root)` est la racine Composer quand Drupal est dans un sous-dossier (`web/`). Si la
+racine Composer est aussi la racine web, écrire `$app_root . '/.autoupdate/maintenance'` : `check`
+indique le chemin attendu et échoue tant que le bloc manque. `.autoupdate/` est en `0711`, pour que
+l'utilisateur du serveur web (`www-data` en Docker) puisse tester le fichier sans lister le dossier.
+
+La barrière est posée pendant toute la mise à jour si « Mode maintenance » est coché, et toujours
+pendant une restauration. Pour la poser ou la retirer à la main : `touch .autoupdate/maintenance`,
+`rm .autoupdate/maintenance`.
 
 ## Prérequis
 
 Ils sont vérifiés par `check`, et à chaque exécution.
 
 - Drupal **11.2+** (ou 12), PHP 8.3+, Composer **2.4+**, drush dans `vendor/bin`.
-- Outil de dump de la base dans le `PATH` (`mysqldump`/`mariadb-dump`, `pg_dump` ou `sqlite3`).
-  L'image Docker officielle `drupal` n'en contient pas : ajouter `mariadb-client` au `Dockerfile`.
+- Base **MySQL/MariaDB**, seule gérée par le retour arrière, et `mysqldump` ou `mariadb-dump` dans
+  le `PATH`. L'image Docker officielle `drupal` n'en contient pas : ajouter `mariadb-client` au
+  `Dockerfile`.
+- [Barrière](#barrière) dans chaque `settings.php`.
 - Droit d'écriture sur la racine Composer, `composer.lock` et `vendor/`.
 - `composer.lock` cohérent avec `vendor/` (sinon, lancer `composer install` d'abord).
 - `cweagans/composer-patches` : en 1.x, `"composer-exit-on-patch-failure": true` dans `extra` ; en
@@ -208,9 +246,9 @@ vendor/bin/drupal-autoupdate [run|check|reconcile|notify-test] [options]
 | `--root=DIR` | racine Composer, si la détection échoue |
 | `--composer=CMD` | commande Composer, si elle n'est pas dans le `PATH` |
 
-Journaux, sauvegardes (lock + dump de chaque base) et dernier lock appliqué : dossier
-`.autoupdate/` de la racine Composer. Il s'exclut lui-même de git et bloque l'accès web par un
-`.htaccess`.
+Journaux, sauvegardes (lock + dump de chaque base), dernier lock appliqué et barrière
+(`maintenance`) : dossier `.autoupdate/` de la racine Composer. Il s'exclut lui-même de git et
+bloque l'accès web par un `.htaccess`.
 
 ## Suspendre ou désinstaller
 
@@ -226,15 +264,22 @@ Journaux, sauvegardes (lock + dump de chaque base) et dernier lock appliqué : d
 
 ```
 cd <racine Composer>
+touch .autoupdate/maintenance   # barrière : plus aucune requête web n'atteint la base
 cp .autoupdate/backups/<date>/composer.json .autoupdate/backups/<date>/composer.lock .
 cp .autoupdate/backups/<date>/patches.lock.json . 2>/dev/null
 composer install --no-dev
-cp .autoupdate/backups/<date>/db-0.sql.gz /tmp/restore.sql.gz   # db-1, db-2… pour les autres sites
-drush sql:drop -y && drush sql:query --file=/tmp/restore.sql.gz
+(umask 077 && cp .autoupdate/backups/<date>/db-0.sql.gz .autoupdate/restore.sql.gz)   # db-1, db-2… pour les autres sites
+drush sql:query --file="$PWD/.autoupdate/restore.sql.gz" --file-delete
 drush cache:rebuild && drush state:set system.maintenance_mode 0 --input-format=integer
+rm .autoupdate/maintenance   # une fois le site vérifié
 ```
 
-Travailler sur une **copie** du dump : `drush sql:query` décompresse le fichier sur place.
+- Travailler sur une **copie privée** du dump : `drush sql:query` le décompresse sur place.
+  `--file-delete` supprime la version décompressée après un import réussi ; sinon,
+  `rm .autoupdate/restore.sql`.
+- Pas de `drush sql:drop` : le dump supprime et recrée chacune de ses tables, et un import
+  interrompu se relance tel quel. Les tables créées par la mise à jour restent, sans effet en
+  général (le retour arrière automatique, lui, les supprime).
 
 ## Limites
 
@@ -242,4 +287,8 @@ Travailler sur une **copie** du dump : `drush sql:query` décompresse le fichier
   manuel.
 - Les tests HTTP détectent les erreurs fatales (réponse 500 ou plus), pas les régressions
   fonctionnelles. La préproduction, avec un âge minimal plus court, sert de canari.
-- Le site est en maintenance pendant `composer install` et `updatedb`, soit une à trois minutes.
+- Le site est coupé (503) pendant le dump, `composer install` et `updatedb`, soit une à trois
+  minutes. Un retour arrière y ajoute l'import de la base : plusieurs minutes selon sa taille
+  (2 min 30 pour 32 Mo de SQL sur la préproduction CH Niort).
+- Après un retour arrière, caches et journal `watchdog` sont vides et les utilisateurs déconnectés :
+  ces tables sont sauvegardées sans leurs données.
