@@ -20,7 +20,8 @@ Aucune action humaine n'est nécessaire dans le cas courant. Le serveur prend de
 3. Tests HTTP de référence, [barrière](#barrière) et mode maintenance, dump de chaque base
    (caches, sessions, verrous et journal `watchdog` sans leurs données), vérifié complet.
 4. `composer install`, `drush updatedb` et `drush cache:rebuild` sur chaque site, sortie du mode
-   maintenance, tests internes, levée de la barrière, tests des URLs externes.
+   maintenance, tests internes, levée de la barrière, tests des URLs externes. Un test en échec est
+   rejoué trois fois à cinq secondes d'intervalle avant de conclure.
 5. **En cas d'échec** : barrière, ancien lock réinstallé, bases restaurées sans être vidées au
    préalable (import rejoué jusqu'à trois fois), tables comparées une à une à la sauvegarde,
    maintenance rétablie.

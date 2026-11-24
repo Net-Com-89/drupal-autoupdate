@@ -1108,11 +1108,19 @@ final class Runner {
       if (!$baseline && in_array($label, $this->brokenBefore, TRUE)) {
         continue;
       }
-      [$status, $output] = $test();
-      $this->log->line("Test $label : HTTP $status");
-      if ($status === 0 || $status >= 500) {
+      // Juste après la sortie de maintenance, l'ancien état peut encore répondre 503 quelques secondes.
+      for ($attempt = 1; ; $attempt++) {
+        [$status, $body] = $test();
+        $ok = $status !== 0 && $status < 500;
+        $this->log->line("Test $label : HTTP $status" . ($ok ? '' : ' : ' . self::excerpt($body)));
+        if ($ok || $baseline || $attempt > RETRIES) {
+          break;
+        }
+        sleep(RETRY_DELAY);
+      }
+      if (!$ok) {
         if (!$baseline) {
-          throw new Failure("Le test de $label répond $status.", $output);
+          throw new Failure("Le test de $label répond $status" . ($attempt > 1 ? " ($attempt essais)" : '') . '.', $status === 0 ? $body : self::excerpt($body));
         }
         $failed[] = $label;
       }
@@ -1122,6 +1130,7 @@ final class Runner {
 
   /**
    * @return array<string, callable(): array{int, string}>
+   *   Code HTTP (0 si aucune réponse) et corps, ou sortie de drush à défaut.
    */
   private function smokeTests(?bool $external): array {
     $tests = [];
@@ -1130,19 +1139,23 @@ final class Runner {
         $tests[$path . ($uri !== NULL ? " ($uri)" : '')] = function () use ($uri, $path): array {
           // SCRIPT_NAME porte le chemin de base d'un multisite par chemin (/actus) : sans lui, il
           // reste dans le chemin demandé, aucune route ne correspond et Drupal redirige.
-          $code = sprintf('$c = \Drupal::request(); $b = $c->getBaseUrl(); $r = \Symfony\Component\HttpFoundation\Request::create($c->getSchemeAndHttpHost() . $b . %s, "GET", [], [], [], ["SCRIPT_NAME" => $b . "/index.php", "SCRIPT_FILENAME" => DRUPAL_ROOT . "/index.php"]); echo "\nNAU_STATUS:", \Drupal::service("http_kernel")->handle($r)->getStatusCode();', var_export($path, TRUE));
+          $code = sprintf('$c = \Drupal::request(); $b = $c->getBaseUrl(); $r = \Symfony\Component\HttpFoundation\Request::create($c->getSchemeAndHttpHost() . $b . %s, "GET", [], [], [], ["SCRIPT_NAME" => $b . "/index.php", "SCRIPT_FILENAME" => DRUPAL_ROOT . "/index.php"]); $resp = \Drupal::service("http_kernel")->handle($r); echo "\nNAU_STATUS:", $resp->getStatusCode(), "\n", $resp->getContent();', var_export($path, TRUE));
           [, $out] = $this->p->drush($uri, ['php:eval', $code], FALSE);
-          return [preg_match('/NAU_STATUS:(\d+)/', $out, $m) ? (int) $m[1] : 0, $out];
+          return preg_match('/\nNAU_STATUS:(\d+)\n/', $out, $m, PREG_OFFSET_CAPTURE)
+            ? [(int) $m[1][0], substr($out, $m[0][1] + strlen($m[0][0]))]
+            : [0, $out];
         };
       }
     }
     foreach ($external === FALSE ? [] : (array) $this->settings['smoke_urls'] as $url) {
-      $tests[$url] = function () use ($url): array {
-        [$status, $body] = Http::request('GET', $url);
-        return [$status, mb_substr(strip_tags($body), 0, 2000)];
-      };
+      $tests[$url] = fn (): array => Http::request('GET', $url);
     }
     return $tests;
+  }
+
+  private static function excerpt(string $html): string {
+    $text = strip_tags((string) preg_replace('#<(script|style)\b.*?</\1>#si', '', $html));
+    return mb_substr(trim((string) preg_replace('/\s+/', ' ', $text)), 0, 300);
   }
 
   private function setMaintenance(bool $on): void {
