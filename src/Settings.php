@@ -40,6 +40,7 @@ final class Settings {
     'rollback' => 'Échec, retour arrière effectué',
     'error' => 'Erreur',
     'critical' => 'Échec du retour arrière',
+    'ack' => 'Suspension acquittée',
     'warning' => 'Avertissement',
   ];
 

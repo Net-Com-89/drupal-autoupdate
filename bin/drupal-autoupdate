@@ -21,6 +21,8 @@ const LOGS_KEPT = 30;
 const PATCHES_LOCK = 'patches.lock.json';
 // Drapeau testé par settings.php (README § Barrière) : 503 avant tout accès à la base.
 const BARRIER = 'maintenance';
+const HALT = 'critical.json';
+const ACK_HINT = 'Une fois le site vérifié, lancer vendor/bin/drupal-autoupdate ack.';
 // Sauvegardées sans données : vides après restauration, rien qu'une requête concurrente puisse dupliquer.
 const STRUCTURE_ONLY = 'cache_*,cachetags,sessions,semaphore,watchdog';
 const RETRIES = 3;
@@ -334,6 +336,49 @@ final class Project {
   }
 
   /**
+   * Raison de refuser toute exécution, NULL s'il n'y en a pas.
+   */
+  public function halt(): ?string {
+    if (is_file("$this->workDir/" . HALT)) {
+      $data = json_decode((string) file_get_contents("$this->workDir/" . HALT), TRUE) ?: [];
+      return 'Exécutions suspendues depuis le ' . date('d/m/Y H:i', (int) ($data['time'] ?? 0)) . ' : ' . ($data['reason'] ?? '?')
+        . ($this->barrierUp() ? ' Site coupé (503) par la barrière de maintenance.' : '');
+    }
+    return $this->barrierUp()
+      ? 'Barrière de maintenance en place depuis le ' . date('d/m/Y H:i', (int) filemtime("$this->workDir/" . BARRIER)) . ' (.autoupdate/' . BARRIER . ', site en 503) : exécution précédente interrompue ?'
+      : NULL;
+  }
+
+  /**
+   * @param array<string, bool> $maintenance
+   *   Mode maintenance d'avant la mise à jour, par URI drush ('' : site par défaut).
+   */
+  public function suspend(string $reason, array $maintenance): void {
+    @file_put_contents("$this->workDir/" . HALT, json_encode(['time' => time(), 'reason' => $reason, 'maintenance' => $maintenance], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+  }
+
+  // Sous la barrière, comme en fin de mise à jour : le retour arrière a laissé Drupal en maintenance.
+  public function resume(): void {
+    $data = json_decode((string) @file_get_contents("$this->workDir/" . HALT), TRUE) ?: [];
+    foreach ($data['maintenance'] ?? [] as $uri => $on) {
+      $this->drush($uri === '' ? NULL : (string) $uri, ['state:set', 'system.maintenance_mode', $on ? '1' : '0', '--input-format=integer']);
+    }
+    @unlink("$this->workDir/" . HALT);
+    $this->barrier(FALSE);
+  }
+
+  // Le verrou est libéré à la mort du processus : un verrou pris signale une exécution vivante.
+  public function running(): bool {
+    $handle = @fopen("$this->workDir/run.lock", 'c');
+    if (!$handle) {
+      return FALSE;
+    }
+    $free = flock($handle, LOCK_EX | LOCK_NB);
+    fclose($handle);
+    return !$free;
+  }
+
+  /**
    * @return list<string>
    */
   public function tables(?string $uri): array {
@@ -519,6 +564,12 @@ final class Checker {
   public function run(): array {
     $p = $this->p;
     $r = [];
+    if ($p->running()) {
+      $r[] = ['warn', 'Une exécution est en cours.'];
+    }
+    elseif (($halt = $p->halt()) !== NULL) {
+      $r[] = ['fail', "$halt " . ACK_HINT];
+    }
     $version = $p->composerVersion();
     $r[] = match (TRUE) {
       $version === NULL => ['fail', 'Composer introuvable (option --composer).'],
@@ -799,6 +850,10 @@ final class Runner {
       $this->log->line('Désactivé dans les réglages : rien à faire.');
       return 0;
     }
+    $halt = $this->dryRun ? NULL : $this->p->halt();
+    if ($halt !== NULL) {
+      return $this->finish('critical', "$halt " . ACK_HINT);
+    }
     // Copies laissées par une restauration interrompue.
     array_map('unlink', glob("{$this->p->workDir}/restore-*") ?: []);
     $this->sites = $this->p->sites();
@@ -1027,7 +1082,13 @@ final class Runner {
       if ($restored) {
         $this->p->barrier(FALSE);
       }
-      return $this->finish('critical', 'Échec : ' . $cause->getMessage() . ' Puis échec du retour arrière : ' . $e->getMessage() . ($this->p->barrierUp() ? ' Site coupé (503) par la barrière de maintenance.' : '') . " Intervention requise : sauvegardes dans $this->backupDir.", $e->excerpt());
+      $reason = 'Échec : ' . $cause->getMessage() . ' Puis échec du retour arrière : ' . $e->getMessage();
+      $states = [];
+      foreach ($this->sites as $i => $uri) {
+        $states[(string) $uri] = !empty($this->maintenance[$i]);
+      }
+      $this->p->suspend($reason, $states);
+      return $this->finish('critical', "$reason " . ($this->p->barrierUp() ? 'Site coupé (503) par la barrière de maintenance. ' : '') . "Sauvegardes dans $this->backupDir. Exécutions suspendues. " . ACK_HINT, $e->excerpt());
     }
     return $this->finish('rollback', 'Échec : ' . $cause->getMessage() . ' Retour à l\'état précédent effectué.', $cause->excerpt());
   }
@@ -1402,6 +1463,8 @@ function usage(): string {
     check        Vérifie les prérequis sans rien modifier.
     reconcile    Au déploiement, après la mise à jour du code et avant composer install :
                  empêche le lock du dépôt de faire reculer les paquets du serveur.
+    ack          Après un échec du retour arrière ou une exécution interrompue, une fois
+                 le site vérifié : lève la suspension et la barrière de maintenance.
     notify-test  Envoie un message de test sur le webhook Discord.
 
   Options :
@@ -1409,9 +1472,38 @@ function usage(): string {
     --uri=URI        Site drush qui porte les réglages (multisite).
     --composer=CMD   Commande Composer (détectée sinon).
     --force          run : passe outre la case « Activer ».
+                     ack : lève la barrière même si Drupal ne démarre pas.
     --dry-run        run : calcule et affiche les mises à jour sans les appliquer.
 
   TXT;
+}
+
+function acknowledge(Project $p, Logger $log, bool $force): int {
+  $halt = $p->halt();
+  if ($halt === NULL) {
+    $log->line('Aucune suspension à lever.');
+    return 0;
+  }
+  $log->line($halt);
+  // Lever la barrière sur une base vide servirait l'installeur.
+  if ($p->barrierUp() && !$force) {
+    foreach ($p->sites() as $uri) {
+      [$code, $out] = $p->drush($uri, ['status', '--field=bootstrap'], FALSE);
+      if ($code !== 0 || trim($out) !== 'Successful') {
+        $log->line('Drupal ne démarre pas (' . ($uri ?? 'site par défaut') . ') : barrière maintenue. Restaurer la base (README § Restauration manuelle), ou forcer avec --force.');
+        return 1;
+      }
+    }
+  }
+  $p->resume();
+  $log->line('Suspension levée, barrière retirée.');
+  try {
+    $p->recordHistory(['time' => time(), 'command' => 'ack', 'status' => 'ack', 'summary' => "Acquitté : $halt", 'changes' => [], 'held' => [], 'warnings' => []]);
+    $p->notify('☑️ **' . $p->label() . '** — Suspension acquittée, les mises à jour automatiques reprennent.');
+  }
+  catch (\Throwable) {
+  }
+  return 0;
 }
 
 function main(array $argv): int {
@@ -1429,7 +1521,7 @@ function main(array $argv): int {
     echo usage();
     return 0;
   }
-  if (!in_array($command, ['run', 'check', 'reconcile', 'notify-test'], TRUE)) {
+  if (!in_array($command, ['run', 'check', 'reconcile', 'ack', 'notify-test'], TRUE)) {
     fwrite(STDERR, "Commande inconnue : $command\n\n" . usage());
     return 2;
   }
@@ -1465,9 +1557,11 @@ function main(array $argv): int {
     $log->line('Une exécution est déjà en cours.');
     return 0;
   }
-  return $command === 'reconcile'
-    ? (new Reconciler($p, $log))->run()
-    : (new Runner($p, $log, isset($options['force']), isset($options['dry-run'])))->run();
+  return match ($command) {
+    'reconcile' => (new Reconciler($p, $log))->run(),
+    'ack' => acknowledge($p, $log, isset($options['force'])),
+    default => (new Runner($p, $log, isset($options['force']), isset($options['dry-run'])))->run(),
+  };
 }
 
 try {

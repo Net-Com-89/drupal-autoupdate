@@ -24,7 +24,8 @@ Aucune action humaine n'est nécessaire dans le cas courant. Le serveur prend de
    rejoué trois fois à cinq secondes d'intervalle avant de conclure.
 5. **En cas d'échec** : barrière, ancien lock réinstallé, bases restaurées sans être vidées au
    préalable (import rejoué jusqu'à trois fois), tables comparées une à une à la sauvegarde,
-   maintenance rétablie.
+   maintenance rétablie. Si ce retour arrière échoue, les exécutions suivantes sont refusées
+   jusqu'à un [acquittement](#ce-qui-demande-une-action-humaine).
 6. **En cas de succès** : relevé de la config modifiée par les update hooks, pour la préserver aux
    déploiements suivants (voir [Déploiement](#déploiement)).
 7. Notification Discord (rien n'est envoyé quand tout est déjà à jour), historique visible dans
@@ -187,8 +188,13 @@ Chaque cas est notifié sur Discord et enregistré dans l'historique.
 | 🛑 Nouveau plugin Composer à autoriser | un paquet apporte un plugin absent de `allow-plugins` | l'ajouter au `composer.json` du dépôt et déployer |
 | 🛑 Bloquée par le garde-fou | une contrainte de `composer.json` laisse passer une majeure (`*`, `>=`) | resserrer la contrainte (`^`) |
 | ↩️ Échec, retour arrière effectué | `composer install`, `updatedb` ou un test HTTP a échoué, souvent un patch qui ne s'applique plus | corriger en dev, déployer ; la nuit suivante retentera |
-| 🚨 Échec du retour arrière | rarissime : le site est peut-être cassé. Si la base n'a pas pu être restaurée, la barrière reste en place (503) | vérifier le site, [restauration manuelle](#restauration-manuelle) si besoin, puis `rm .autoupdate/maintenance` |
+| 🚨 Échec du retour arrière | rarissime : le site est peut-être cassé. Si la base n'a pas pu être restaurée, la barrière reste en place (503) | vérifier le site, [restauration manuelle](#restauration-manuelle) si besoin, puis `vendor/bin/drupal-autoupdate ack` |
+| 🚨 Exécutions suspendues (chaque nuit) | retour arrière en échec non acquitté, ou barrière restée en place après une exécution tuée (mémoire, redémarrage) | idem |
 | ❌ Prérequis non remplis | voir `check` | corriger |
+
+`ack` rétablit le mode maintenance Drupal d'avant la mise à jour, lève la suspension et retire la
+barrière. Il refuse tant que Drupal ne démarre pas (la barrière empêche alors l'installeur d'être
+servi), sauf avec `--force`.
 
 ## Barrière
 
@@ -217,7 +223,7 @@ l'utilisateur du serveur web (`www-data` en Docker) puisse tester le fichier san
 
 La barrière est posée pendant toute la mise à jour si « Mode maintenance » est coché, et toujours
 pendant une restauration. Pour la poser ou la retirer à la main : `touch .autoupdate/maintenance`,
-`rm .autoupdate/maintenance`.
+`vendor/bin/drupal-autoupdate ack`.
 
 ## Prérequis
 
@@ -228,6 +234,7 @@ Ils sont vérifiés par `check`, et à chaque exécution.
   le `PATH`. L'image Docker officielle `drupal` n'en contient pas : ajouter `mariadb-client` au
   `Dockerfile`.
 - [Barrière](#barrière) dans chaque `settings.php`.
+- Aucune suspension en cours (voir `ack`).
 - Droit d'écriture sur la racine Composer, `composer.lock` et `vendor/`.
 - `composer.lock` cohérent avec `vendor/` (sinon, lancer `composer install` d'abord).
 - `cweagans/composer-patches` : en 1.x, `"composer-exit-on-patch-failure": true` dans `extra` ; en
@@ -236,20 +243,20 @@ Ils sont vérifiés par `check`, et à chaque exécution.
 ## Commandes
 
 ```
-vendor/bin/drupal-autoupdate [run|check|reconcile|notify-test] [options]
+vendor/bin/drupal-autoupdate [run|check|reconcile|ack|notify-test] [options]
 ```
 
 | Option | Rôle |
 | ------ | ---- |
-| `--dry-run` | `run` : affiche les mises à jour sans les appliquer |
-| `--force` | `run` : passe outre la case « Activer » (test manuel) |
+| `--dry-run` | `run` : affiche les mises à jour sans les appliquer (possible pendant une suspension) |
+| `--force` | `run` : passe outre la case « Activer » (test manuel) ; `ack` : retire la barrière même si Drupal ne démarre pas |
 | `--uri=URI` | site drush qui porte les réglages (multisite, si ce n'est pas le site par défaut) |
 | `--root=DIR` | racine Composer, si la détection échoue |
 | `--composer=CMD` | commande Composer, si elle n'est pas dans le `PATH` |
 
-Journaux, sauvegardes (lock + dump de chaque base), dernier lock appliqué et barrière
-(`maintenance`) : dossier `.autoupdate/` de la racine Composer. Il s'exclut lui-même de git et
-bloque l'accès web par un `.htaccess`.
+Journaux, sauvegardes (lock + dump de chaque base), dernier lock appliqué, barrière
+(`maintenance`) et suspension (`critical.json`) : dossier `.autoupdate/` de la racine Composer. Il
+s'exclut lui-même de git et bloque l'accès web par un `.htaccess`.
 
 ## Suspendre ou désinstaller
 
@@ -272,7 +279,7 @@ composer install --no-dev
 (umask 077 && cp .autoupdate/backups/<date>/db-0.sql.gz .autoupdate/restore.sql.gz)   # db-1, db-2… pour les autres sites
 drush sql:query --file="$PWD/.autoupdate/restore.sql.gz" --file-delete
 drush cache:rebuild && drush state:set system.maintenance_mode 0 --input-format=integer
-rm .autoupdate/maintenance   # une fois le site vérifié
+vendor/bin/drupal-autoupdate ack   # vérifie que Drupal démarre, puis retire la barrière
 ```
 
 - Travailler sur une **copie privée** du dump : `drush sql:query` le décompresse sur place.
